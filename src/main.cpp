@@ -3,13 +3,17 @@
 #include <SSD1306Wire.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
+#include <time.h>
 
 //Variables
 SSD1306Wire display(0x3C, 12, 14);
 unsigned long anteriorMillis = 0;
 unsigned long ultimaActualizaciónInfo = 0;
+unsigned long segundo = 0;
 int estadoLed = HIGH;
 bool mensajeMostrado = false;
+
+const char* MY_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; // Zona horaria de Madrid (CET/CEST)
 
 // Credenciales
 const char* ssid     = "MOVISTAR_1D80";
@@ -19,6 +23,7 @@ const char* password = "nhM9ing7k4793YnX74ni";
 void displaySetUp();
 void wifiSetUp();
 void blinkLed (int parpadeo);
+void mostrarHora (void);
 
 void setup() {
   Serial.begin(74880);
@@ -27,12 +32,20 @@ void setup() {
   wifiSetUp();
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, estadoLed);
+  configTime(MY_TZ, "pool.ntp.org", "time.google.com");
+  Serial.println("\nEsperando a sincronización horaria...");
 }
 
 void loop() {
   // 1. El LED se actualiza CONSTANTEMENTE (sin bloqueos)
   if(WiFi.status() == WL_CONNECTED) {
-    blinkLed(1000); 
+    blinkLed(1000);
+
+    if (millis() - segundo >= 1000){
+      segundo = millis(); 
+      mostrarHora(); 
+    }
+
   } else {
     blinkLed(100);
     mensajeMostrado = false;
@@ -118,5 +131,20 @@ void blinkLed (int parpadeo){
     estadoLed = (estadoLed == LOW) ? HIGH : LOW;
     digitalWrite(LED_BUILTIN, estadoLed);
 
+  }
+}
+
+void mostrarHora (void){
+  time_t now = time(nullptr);
+  struct tm* p_tm = localtime(&now);
+
+  if(p_tm->tm_year > 70){ //Si y solo si el año es mayor a 1970.
+    Serial.printf("%02d/%02d/%04d %02d:%02d:%02d\n", 
+                  p_tm->tm_mday, 
+                  p_tm->tm_mon + 1, 
+                  p_tm->tm_year + 1900, 
+                  p_tm->tm_hour, 
+                  p_tm->tm_min, 
+                  p_tm->tm_sec);
   }
 }
