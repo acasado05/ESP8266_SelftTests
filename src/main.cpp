@@ -4,6 +4,8 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <time.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
 
 //Variables
 SSD1306Wire display(0x3C, 12, 14);
@@ -12,30 +14,40 @@ unsigned long segundo = 0;
 int estadoLed = HIGH;
 unsigned long mensajeMostrado = 0;
 unsigned long tiempoInicioEstado = 0;
-const char* temp = "25.3ºC";
-const char* hum = "60%";
 unsigned long tiempoIntercalado = 0;
 int estadoPantalla = 0;
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+float tempTotal = 0.0;
 
 const char* MY_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; // Zona horaria de Madrid (CET/CEST)
 
 // Credenciales
 /*const char* ssid     = "MOVISTAR_1D80";
 const char* password = "nhM9ing7k4793YnX74ni"; */
-const char* ssid     = "T0rt1s_A54";
-const char* password = "tortis007";
+/* const char* ssid     = "T0rt1s_A54";
+const char* password = "tortis007"; */
+const char* ssid     = "ZTEG5B1-2287D6";
+const char* password = "2qT2mjgtr52y7456";
+
 
 // Prototipos de funciones
 void displaySetUp();
 void wifiSetUp();
 void blinkLed (int parpadeo);
 void mostrarHora (void);
-void mostrarTempHum (void);
+void sensorReadings (void);
 
 void setup() {
   Serial.begin(74880);
   delay(2000); // Esperamos 2 segundos a que se estabilice el Serial
   displaySetUp();
+  if(!aht.begin()) {
+    Serial.println("No se encontró el sensor AHT10/AHT20");
+  }
+  if(!bmp.begin(BMP280_ADDRESS)) {
+    Serial.println("No se encontró el sensor BMP280");
+  }
   wifiSetUp();
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, estadoLed);
@@ -85,7 +97,7 @@ void loop() {
           if (estadoPantalla == 0) {
             mostrarHora();
           } else {
-            mostrarTempHum();
+            sensorReadings();
           }
         }
         break;
@@ -174,11 +186,30 @@ void mostrarHora (void){
   }
 }
 
-void mostrarTempHum (void){
+void sensorReadings (void){
+  sensors_event_t humidity, temp_aht;
+  char tBuffer[10];
+  char hBuffer[10];
+  aht.getEvent(&humidity, &temp_aht); // Get temperature and humidity event data
+  
+  float temp_aht_value = temp_aht.temperature;
+  float temp_bmp = bmp.readTemperature();
+
+  tempTotal = (temp_aht_value + temp_bmp) / 2.0; // Promedio de las dos temperaturas
+
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_CENTER);
-  display.setFont(ArialMT_Plain_24);
-  display.drawString(64, 10, temp);
-  display.drawString(64, 30, hum);
+  display.setFont(ArialMT_Plain_10);
+
+  display.drawString(64, 0, "Temperatura actual:");
+  snprintf(tBuffer, sizeof(tBuffer), "%.2f ºC", tempTotal);
+  display.drawString(64, 15, tBuffer);
+
+  display.drawString(64, 30, "Humedad actual:");
+  snprintf(hBuffer, sizeof(hBuffer), "%.2f %%", humidity.relative_humidity);
+  display.drawString(64, 45, hBuffer);
+
   display.display();
+
+  Serial.printf("AHT: %.2f ºC, BMP: %.2f ºC, Promedio: %.2f ºC, Humedad: %.2f %%\n", temp_aht_value, temp_bmp, tempTotal, humidity.relative_humidity);
 }
