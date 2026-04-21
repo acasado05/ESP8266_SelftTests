@@ -21,10 +21,10 @@ unsigned long anteriorMillisBlink = 0;
 const char* MY_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; // Zona horaria de Madrid
 
 // Credenciales WiFi
-/*const char* ssid     = "TP-LINK_C062";
-const char* password = "77817570";*/
-const char* ssid     = "T0rt1s_A54";
-const char* password = "tortis007";
+const char* ssid     = "TP-LINK_C062";
+const char* password = "77817570";
+/*const char* ssid     = "T0rt1s_A54";
+const char* password = "tortis007";*/
 
 // Prototipos
 void wifiSetUp();
