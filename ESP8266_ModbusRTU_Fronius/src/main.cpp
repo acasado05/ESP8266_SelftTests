@@ -102,26 +102,11 @@
 #include <Arduino.h>
 #include <ModbusMaster.h>
 #include <Wire.h>
-#include <SSD1306Wire.h>
-#include <SoftwareSerial.h>
-
-// ── Debug por Serial1 (GPIO2 TX-only, 115200 bps) ────────────
-#define DEBUG_ENABLED
-
-#ifdef DEBUG_ENABLED
-  #define DBG_BEGIN()  Serial1.begin(115200)
-  #define DBG(x)       Serial1.print(x)
-  #define DBGLN(x)     Serial1.println(x)
-  #define DBGF(...)    Serial1.printf(__VA_ARGS__)
-#else
-  #define DBG_BEGIN()
-  #define DBG(x)
-  #define DBGLN(x)
-  #define DBGF(...)
-#endif
 
 // ── Configuracion Modbus ──────────────────────────────────────
-#define MODBUS_ID          1        // Cambiar a 100 si no responde
+#define MODBUS_ID          100        // Cambiar a 100 si no responde
+#define PIN_RX2            16
+#define PIN_TX2            17
 #define MODBUS_BAUD        9600UL
 
 // ── Timing ───────────────────────────────────────────────────
@@ -151,7 +136,6 @@
 
 // ── Objetos globales ──────────────────────────────────────────
 ModbusMaster modbus;
-SSD1306Wire display(0x3C, 12, 14);
 
 // ── Estructura de datos del inversor ─────────────────────────
 struct InverterData {
@@ -178,59 +162,54 @@ bool        readMPPTScaleFactors();
 bool        readMPPTString(uint8_t str, float &I, float &V, float &P);
 bool        readACBlock();
 void        runReadCycle();
-void        updateOLED();
+//void        updateOLED();
 void        printDebug();
+void        preTransmission();
+void        postTransmission();
 const char* stateStr(uint16_t st);
 
 // =============================================================
 void setup() {
-    // UART0 exclusivo para Modbus RTU (9600 8N1)
-    Serial.begin(MODBUS_BAUD, SERIAL_8N1);
 
-    DBG_BEGIN();
-    delay(300);
+    Serial.begin(115200); 
 
-    // Inicializar ModbusMaster sobre UART0.
-    // El modulo MAX3485 auto-direction no necesita callbacks
-    // preTransmission/postTransmission; controla DE/RE solo.
-    Serial.setTimeout(MODBUS_TIMEOUT_MS);
-    modbus.begin(MODBUS_ID, Serial);
-    
+    // 1. Iniciamos UART2 (Modbus) con sus pines (16 y 17)
+    Serial2.begin(MODBUS_BAUD, SERIAL_8N1, PIN_RX2, PIN_TX2);
 
-    // OLED: SDA=GPIO4(D2), SCL=GPIO5(D1)
-    Wire.begin(12, 14);
-    
-    display.init();
-    display.flipScreenVertically();
-    display.setTextAlignment(TEXT_ALIGN_CENTER);
-    display.setFont(ArialMT_Plain_10);
-    display.clear();
+    // 2. Aplicamos el timeout a Serial2 (MUY IMPORTANTE)
+    //Serial2.setTimeout(MODBUS_TIMEOUT_MS);
 
-    display.drawString(0, 0, "Fronius Primo");
-    display.drawString(0, 12, "Modbus RTU");
-    display.drawString(0, 26, "ID Modbus: " + String(MODBUS_ID));
-    display.drawString(0, 38, "Baud: " + String(MODBUS_BAUD));
-    display.drawString(0, 52, "Iniciando...");
-    display.display();
+    // 3. Vinculamos la librería ModbusMaster a Serial2
+    modbus.begin(MODBUS_ID, Serial2);
 
-    DBGLN("\n=== Fronius Primo RTU Reader ===");
-    DBGF("Modbus ID  : %d\n", MODBUS_ID);
-    DBGF("Baudrate   : %lu bps\n", MODBUS_BAUD);
-    DBGLN("MAX3485    : auto-direction (sin DE/RE externo)");
-    DBGLN("================================\n");
+    modbus.preTransmission(preTransmission);
+    modbus.postTransmission(postTransmission);
 
-    delay(1500);
+    // 4. UART0 (Serial) queda libre para ver mensajes en el PC  
+    Serial.println("Comunicacion con Fronius iniciada en UART2...");
 }
 
 // =============================================================
 void loop() {
+    delay(100);
     static uint32_t lastPoll = 0;
     if (millis() - lastPoll < POLL_INTERVAL_MS) return;
     lastPoll = millis();
 
     runReadCycle();
-    updateOLED();
+    //updateOLED();
     printDebug();
+}
+
+void preTransmission() {
+    // Flush cualquier byte residual antes de transmitir
+    while (Serial2.available()) Serial2.read();
+}
+
+void postTransmission() {
+    // Dar tiempo al módulo para volver a RX y vaciar el eco
+    delay(2);
+    while (Serial2.available()) Serial2.read();  // descartar eco propio
 }
 
 // =============================================================
@@ -241,18 +220,18 @@ void runReadCycle() {
 
     // Scale factors (si fallan, continua con valores por defecto)
     if (!readMPPTScaleFactors()) {
-        DBGLN("[WARN] SF no leidos, usando sf=-2 (x0.01)");
+        Serial.println("[WARN] SF no leidos, usando sf=-2 (x0.01)");
     }
 
     // String 1 — obligatorio
     if (!readMPPTString(1, inv.Idc1, inv.Vdc1, inv.Pdc1)) {
-        DBGLN("[ERR] Fallo MPPT1 — abortando ciclo");
+        Serial.println("[ERR] Fallo MPPT1 — abortando ciclo");
         return;
     }
 
     // String 2 — no fatal (puede haber un solo string activo)
     if (!readMPPTString(2, inv.Idc2, inv.Vdc2, inv.Pdc2)) {
-        DBGLN("[WARN] Fallo MPPT2 — asumiendo 0");
+        Serial.println("[WARN] Fallo MPPT2 — asumiendo 0");
         inv.Idc2 = inv.Vdc2 = inv.Pdc2 = 0.0f;
     }
 
@@ -260,7 +239,7 @@ void runReadCycle() {
 
     // Bloque AC — obligatorio
     if (!readACBlock()) {
-        DBGLN("[ERR] Fallo bloque AC — abortando ciclo");
+        Serial.println("[ERR] Fallo bloque AC — abortando ciclo");
         return;
     }
 
@@ -278,10 +257,10 @@ bool readMPPTScaleFactors() {
             sf_DCA = (int16_t)modbus.getResponseBuffer(0);
             sf_DCV = (int16_t)modbus.getResponseBuffer(1);
             sf_DCW = (int16_t)modbus.getResponseBuffer(2);
-            DBGF("[SF] DCA=%d DCV=%d DCW=%d\n", sf_DCA, sf_DCV, sf_DCW);
+            Serial.printf("[SF] DCA=%d DCV=%d DCW=%d\n", sf_DCA, sf_DCV, sf_DCW);
             return true;
         }
-        DBGF("[SF] retry %d err=0x%02X\n", r + 1, res);
+        Serial.printf("[SF] retry %d err=0x%02X\n", r + 1, res);
         delay(150);
     }
     return false;
@@ -307,10 +286,10 @@ bool readMPPTString(uint8_t str, float &I, float &V, float &P) {
             V = (rawV == 0xFFFF) ? 0.0f : applyScaleFactor(rawV, sf_DCV);
             P = (rawW == 0xFFFF) ? 0.0f : applyScaleFactor(rawW, sf_DCW);
 
-            DBGF("[MPPT%d] I=%.3fA V=%.2fV P=%.1fW\n", str, I, V, P);
+            Serial.printf("[MPPT%d] I=%.3fA V=%.2fV P=%.1fW\n", str, I, V, P);
             return true;
         }
-        DBGF("[MPPT%d] retry %d err=0x%02X\n", str, r + 1, res);
+        Serial.printf("[MPPT%d] retry %d err=0x%02X\n", str, r + 1, res);
         delay(150);
     }
     return false;
@@ -336,11 +315,11 @@ bool readACBlock() {
                 modbus.getResponseBuffer(OFF_AC_POWER + 1));
             inv.state = modbus.getResponseBuffer(OFF_STATE);
 
-            DBGF("[AC] I=%.3fA V=%.2fV P=%.1fW St=%s\n",
+            Serial.printf("[AC] I=%.3fA V=%.2fV P=%.1fW St=%s\n",
                  inv.Iac, inv.Vac, inv.Pac, stateStr(inv.state));
             return true;
         }
-        DBGF("[AC] retry %d err=0x%02X\n", r + 1, res);
+        Serial.printf("[AC] retry %d err=0x%02X\n", r + 1, res);
         delay(150);
     }
     return false;
@@ -387,64 +366,18 @@ const char* stateStr(uint16_t st) {
 }
 
 // =============================================================
-//  OLED — 128x64, text size 1 (6x8 px), 8 filas disponibles
-// =============================================================
-void updateOLED() {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
-
-    if (!inv.valid) {
-        display.drawString(0, 0, "FRONIUS PRIMO");
-        display.drawLine(0, 11, 127, 11);
-        display.drawString(0, 14, "Sin respuesta");
-        display.drawString(0, 28, "Modbus ID: " + String(MODBUS_ID));
-        display.drawString(0, 42, "Comprobar:");
-        display.drawString(0, 54, "GND / ID / cables");
-        display.display();
-        return;
-    }
-
-    // Cabecera
-    display.drawString(0, 0, "FRONIUS  " + String(stateStr(inv.state)));
-    display.drawLine(0, 11, 127, 11);
-
-    // DC Strings
-    display.drawString(0, 12, "S1 " + String(inv.Idc1, 1) + "A " + String(inv.Vdc1, 0) + "V");
-    display.drawString(0, 22, "S2 " + String(inv.Idc2, 1) + "A " + String(inv.Vdc2, 0) + "V");
-    display.drawString(0, 32, "Pdc " + String(inv.PdcTotal, 0) + " W");
-
-    display.drawLine(0, 43, 127, 43);
-
-    // AC Data
-    display.drawString(0, 45, "Pac " + String(inv.Pac, 0) + " W");
-    display.drawString(0, 54, "V " + String(inv.Vac, 1) + "V  I " + String(inv.Iac, 2) + "A");
-
-    display.display();
-}
-
-// =============================================================
 //  Resultados por Serial1 (debug)
 // =============================================================
 void printDebug() {
-    DBGLN("========================================");
     if (!inv.valid) {
-        DBGLN("[ERROR] Ciclo de lectura fallido");
-        DBGLN("========================================\n");
+        Serial.println("[!] Error Modbus: El inversor no responde.");
         return;
     }
-    DBGF("[Estado]   %d - %s\n", inv.state, stateStr(inv.state));
-    DBGLN("--- DC String 1 ---");
-    DBGF("  I : %.3f A\n", inv.Idc1);
-    DBGF("  V : %.2f V\n", inv.Vdc1);
-    DBGF("  P : %.1f W\n", inv.Pdc1);
-    DBGLN("--- DC String 2 ---");
-    DBGF("  I : %.3f A\n", inv.Idc2);
-    DBGF("  V : %.2f V\n", inv.Vdc2);
-    DBGF("  P : %.1f W\n", inv.Pdc2);
-    DBGF("  Pdc Total: %.1f W\n", inv.PdcTotal);
-    DBGLN("--- AC ---");
-    DBGF("  I : %.3f A\n", inv.Iac);
-    DBGF("  V : %.2f V\n", inv.Vac);
-    DBGF("  P : %.1f W\n", inv.Pac);
-    DBGLN("========================================\n");
+
+    Serial.println("\n+---------------------------------------+");
+    Serial.printf("| FRONIUS ID: %-3d | ESTADO: %-10s |\n", MODBUS_ID, stateStr(inv.state));
+    Serial.println("+---------------------------------------+");
+    Serial.printf("| AC Power: %7.1f W | VAC: %5.1f V |\n", inv.Pac, inv.Vac);
+    Serial.printf("| DC Total: %7.1f W | IAC: %5.2f A |\n", inv.PdcTotal, inv.Iac);
+    Serial.println("+---------------------------------------+");
 }
