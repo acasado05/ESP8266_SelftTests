@@ -1,396 +1,450 @@
 /**
  * ============================================================
- *  Fronius Primo 3.0 — Lectura Modbus RTU con ESP8266 + MAX3485
+ *  Fronius Primo 3.0 — Modbus RTU + OLED  (ESP8266 + MAX3485)
  * ============================================================
  *
  *  TFG — Sistema embebido inteligente con Edge AI / TinyML
- *  Plataforma de prueba modular: ESP8266 + MAX3485
- *  Plataforma final:             ESP32-S3-DevKitC-1 + MAX3485
+ *  Plataforma de prueba: ESP8266 NodeMCU + MAX3485 auto-direction
+ *                        + OLED SSD1306 128x64 I2C
  *
- *  Protocolo: Modbus RTU sobre RS485
- *  Mapa de registros: Fronius Datamanager 2.0
- *                     SunSpec Float Model (ID 111 — monofásico)
+ * ── Por que se reescribio el codigo anterior ────────────────
  *
- *  Registros leídos (todos float32, 2 registros de 16-bit c/u):
- *    40072-40073  A     — Corriente AC total      [A]
- *    40086-40087  PhVphA — Tensión AC fase-neutro  [V]
- *    40092-40093  W     — Potencia AC activa       [W]
- *    40104-40105  DCA   — Corriente DC             [A]
- *    40106-40107  DCV   — Tensión DC               [V]
- *    40108-40109  DCW   — Potencia DC total         [W]
- *    40118        St    — Estado operativo          (enum)
+ *  El codigo anterior construia frames Modbus RTU a mano.
+ *  El frame era correcto (visible en PulseView) pero el inversor
+ *  no respondia. Al contrastar con el TFG de referencia y el
+ *  mapa de registros Fronius se identificaron tres causas raiz:
  *
- *  IMPORTANTE — Direccionamiento Modbus:
- *    El protocolo Modbus usa direcciones con base-0, mientras que
- *    el mapa de Fronius las lista con base-1 (40001 = reg 0 en el
- *    frame). La fórmula es:  addr_modbus = addr_fronius - 1
- *    Ejemplo: registro 40072 → se pide dirección 40071 (0x9C57)
+ *  1. REGISTROS INCORRECTOS PARA PRIMO CON 2 MPPTs.
+ *     El mapa advierte que DCA/DCV del modelo base (40104-40107)
+ *     "no estan soportados si hay multiples entradas DC". El
+ *     Primo 3.0 tiene 2 strings MPPT, por lo que hay que usar
+ *     el modelo Multiple MPPT (registros 40283-40305).
+ *     El TFG de referencia confirma esto y usa exactamente esos
+ *     registros con factor de escala x0.01 (sf = -2).
  *
- *  Configuración Modbus:
- *    - Baudrate:   9600 bps (por defecto en Fronius Datamanager 2.0)
- *    - Data bits:  8
- *    - Paridad:    None
- *    - Stop bits:  1  (8N1)
- *    - Modbus ID:  1  (inverter number 1 en menú DATCOM)
- *    - Función:    0x03 (Read Holding Registers)
+ *  2. VALOR 0xFFFF durante arranque/parada.
+ *     Documentado en TFG seccion 5.6: cuando el inversor esta
+ *     encendiendo o apagando devuelve 0xFFFF en los registros.
+ *     Se trata como 0 para evitar datos erroneos.
  *
- *  Conexionado MAX3485 (módulo auto-direction) ↔ ESP8266:
- *    MAX3485 PIN    →  ESP8266 PIN
- *    ------------------------------------
- *    VCC            →  3.3 V
- *    GND            →  GND
- *    TXD / DI       →  GPIO1 / TX (UART0)
- *    RXD / RO       →  GPIO3 / RX (UART0)
- *    A (RS485+)     →  Hilo D+ del bus Fronius (naranja)
- *    B (RS485-)     →  Hilo D- del bus Fronius (blanco)
+ *  3. LIBRERIA ModbusMaster en lugar de frames manuales.
+ *     La libreria 4-20ma/ModbusMaster gestiona internamente el
+ *     timing inter-frame RTU, reintentos y validacion de CRC.
+ *     Elimina los problemas de timing que causaban que el esclavo
+ *     ignorara la peticion.
  *
- *  NOTA módulo auto-direction:
- *    DE y RE están unidos internamente y conectados a la línea DI.
- *    El módulo activa TX automáticamente cuando DI tiene datos, y
- *    vuelve a RX en reposo. NO se necesita pin de control externo.
- *    El GND del bus RS485 del Fronius debe conectarse al GND del
- *    ESP8266 para tener referencia común entre ambos equipos.
+ * ── Registros leidos ────────────────────────────────────────
  *
- *  Conexionado MAX3485 ↔ Fronius Datamanager 2.0:
- *    El Fronius expone RS485 en el conector Modbus del Datamanager.
- *    El hilo naranja del kit Fronius = D+ → MAX3485 A
- *    El hilo blanco  del kit Fronius = D- → MAX3485 B
- *    Activar resistencia de terminación (120 Ω) en el Datamanager
- *    que esté al final físico del bus (switch ON en la PCB).
+ *  Lectura 1 - Scale factors MPPT (FC03, 3 regs desde 40265):
+ *    40266  DCA_SF  int16 (tipicamente -2)
+ *    40267  DCV_SF  int16
+ *    40268  DCW_SF  int16
  *
- *  Debug en desarrollo:
- *    UART0 (Serial) es compartido con el bus Modbus, por lo que los
- *    prints interferirán con el tráfico RS485. Se usa Serial1 (GPIO2,
- *    TX-only) a 115200 bps exclusivamente para depuración. Conectar
- *    un adaptador USB-Serial al GPIO2 para ver los mensajes de debug.
+ *  Lectura 2 - Multiple MPPT String 1 (FC03, 3 regs desde 40282):
+ *    40283  1_DCA  Corriente string 1  uint16  A  x 10^DCA_SF
+ *    40284  1_DCV  Tension string 1    uint16  V  x 10^DCV_SF
+ *    40285  1_DCW  Potencia string 1   uint16  W  x 10^DCW_SF
  *
- *  platformio.ini (ejemplo):
+ *  Lectura 3 - Multiple MPPT String 2 (FC03, 3 regs desde 40302):
+ *    40303  2_DCA  Corriente string 2  uint16  A
+ *    40304  2_DCV  Tension string 2    uint16  V
+ *    40305  2_DCW  Potencia string 2   uint16  W
+ *
+ *  Lectura 4 - Bloque AC (FC03, 47 regs desde 40071):
+ *    40072-40073  A      Corriente AC total  float32  A
+ *    40086-40087  PhVphA Tension AC fase-N   float32  V
+ *    40092-40093  W      Potencia AC activa  float32  W
+ *    40118        St     Estado operativo    uint16   enum
+ *
+ *  Nota direccionamiento: las constantes REG_* ya estan en
+ *  base-0 (= direccion mapa Fronius - 1). ModbusMaster las
+ *  usa directamente.
+ *
+ * ── Configuracion Modbus ─────────────────────────────────────
+ *    Baudrate  : 9600 bps, 8N1
+ *    Modbus ID : 1  (probar 100 si no responde)
+ *
+ *    NOTA ID: verificar en pantalla del Fronius:
+ *    SETUP -> DATCOM -> Wechselrichter-Nr.
+ *    Si el numero mostrado es 0 -> Modbus ID = 100
+ *    Si el numero mostrado es 1 -> Modbus ID = 1
+ *
+ * ── Conexionado ──────────────────────────────────────────────
+ *    MAX3485 auto-direction:
+ *      VCC -> 3.3V         GND -> GND
+ *      TXD -> GPIO1/TX     RXD -> GPIO3/RX
+ *      A   -> D+ Fronius (naranja)
+ *      B   -> D- Fronius (blanco)
+ *      GND bus Fronius -> GND ESP8266  (IMPRESCINDIBLE)
+ *
+ *    OLED SSD1306 I2C:
+ *      SDA -> GPIO4 (D2)   SCL -> GPIO5 (D1)
+ *      VCC -> 3.3V         GND -> GND
+ *
+ *    Debug Serial1 (TX-only):
+ *      GPIO2 (D4) -> RX adaptador USB-Serial a 115200 bps
+ *      Comentar #define DEBUG_ENABLED para deshabilitar.
+ *
+ * ── platformio.ini ───────────────────────────────────────────
  *    [env:esp8266]
- *    platform  = espressif8266
- *    board     = nodemcuv2
- *    framework = arduino
+ *    platform      = espressif8266
+ *    board         = nodemcuv2
+ *    framework     = arduino
  *    monitor_speed = 115200
+ *    lib_deps =
+ *      4-20ma/ModbusMaster @ ^2.0.1
+ *      adafruit/Adafruit SSD1306 @ ^2.5.7
+ *      adafruit/Adafruit GFX Library @ ^1.11.9
  *
  * ============================================================
  */
 
 #include <Arduino.h>
+#include <ModbusMaster.h>
+#include <Wire.h>
+#include <SSD1306Wire.h>
+#include <SoftwareSerial.h>
 
-// ── Debug por Serial1 (GPIO2, TX-only, 115200 bps) ───────────
-// Serial1 no interfiere con el bus Modbus en UART0.
-// Conectar un adaptador USB-Serial al GPIO2 para ver los mensajes.
-// Para deshabilitar el debug basta con comentar esta línea:
+// ── Debug por Serial1 (GPIO2 TX-only, 115200 bps) ────────────
 #define DEBUG_ENABLED
 
 #ifdef DEBUG_ENABLED
-  #define DBG_BEGIN()   Serial1.begin(115200)
-  #define DBG(...)        Serial1.print(__VA_ARGS__)
-  #define DBGLN(...)      Serial1.println(__VA_ARGS__)
-  #define DBGHEX(x)     Serial1.print(x, HEX)
+  #define DBG_BEGIN()  Serial1.begin(115200)
+  #define DBG(x)       Serial1.print(x)
+  #define DBGLN(x)     Serial1.println(x)
+  #define DBGF(...)    Serial1.printf(__VA_ARGS__)
 #else
   #define DBG_BEGIN()
   #define DBG(x)
   #define DBGLN(x)
-  #define DBGHEX(x)
+  #define DBGF(...)
 #endif
 
-// ── Configuración Modbus ──────────────────────────────────────
-#define MODBUS_BAUD    9600
-#define MODBUS_ID      01    // Dirección esclavo del Fronius (ajustar según menú DATCOM)
+// ── Configuracion Modbus ──────────────────────────────────────
+#define MODBUS_ID          1        // Cambiar a 100 si no responde
+#define MODBUS_BAUD        9600UL
 
-// ── Tiempos ───────────────────────────────────────────────────
-// t3.5 = 3.5 tramas de silencio entre mensajes.
-// A 9600 bps, 1 carácter = 1.042 ms → 3.5 chars ≈ 3.65 ms → usamos 4 ms.
-// Tiempo de espera máximo para recibir respuesta completa.
-#define MODBUS_T35_US       4000   // µs de silencio inter-frame
-#define MODBUS_TIMEOUT_MS   500    // ms de espera máxima de respuesta
-#define POLL_INTERVAL_MS    2000   // ms entre lecturas al inversor
+// ── Timing ───────────────────────────────────────────────────
+#define POLL_INTERVAL_MS   5000UL
+#define MODBUS_TIMEOUT_MS  1000UL
+#define MAX_RETRIES        3
 
-// ── Registro base del modelo SunSpec Float (monofásico, ID 111) ─
-// Fronius: registro 40001 → dirección Modbus 0x9C40 (= 40000 en base-0).
-// Todos los registros del mapa se piden con addr = fronius_reg - 1.
-//
-// Bloque de interés (registros Fronius → dirección Modbus en base-0):
-//   40072 → 0x9C57  A      (AC Current)       float32 [2 regs]
-//   40086 → 0x9C65  PhVphA (AC Voltage A-N)   float32 [2 regs]
-//   40092 → 0x9C6B  W      (AC Power)         float32 [2 regs]
-//   40104 → 0x9C77  DCA    (DC Current)       float32 [2 regs]
-//   40106 → 0x9C79  DCV    (DC Voltage)       float32 [2 regs]
-//   40108 → 0x9C7B  DCW    (DC Power)         float32 [2 regs]
-//   40118 → 0x9C85  St     (Operating State)  uint16  [1 reg ]
-//
-// Leemos un único bloque contiguo: desde 40072 hasta 40118 inclusive
-// = 47 registros (0x2F). Así minimizamos las transacciones Modbus.
+// ── Registros Modbus (base-0 = mapa Fronius - 1) ─────────────
+#define REG_MPPT_SF_BASE   40265    // DCA_SF, DCV_SF, DCW_SF
+#define REG_MPPT1_BASE     40282    // I, V, P string 1
+#define REG_MPPT2_BASE     40302    // I, V, P string 2
+#define REG_AC_BASE        40071    // Bloque AC completo (47 regs)
+#define REG_AC_COUNT       47
 
-#define REG_START_FRONIUS   40072   // primer registro del bloque (base-1)
-#define REG_COUNT           47      // número de registros a leer
+// Offsets en el buffer del bloque AC (en registros de 16-bit)
+// offset = fronius_reg - 40072
+#define OFF_AC_CURRENT      0       // 40072-40073  A       float32
+#define OFF_AC_VOLTAGE     14       // 40086-40087  PhVphA  float32
+#define OFF_AC_POWER       20       // 40092-40093  W       float32
+#define OFF_STATE          46       // 40118        St      uint16
 
-// Offsets dentro del buffer de respuesta (cada float32 ocupa 2 words)
-// offset = (fronius_reg - REG_START_FRONIUS)
-#define OFF_AC_CURRENT   0    // 40072-40073  A
-#define OFF_AC_VOLTAGE  14    // 40086-40087  PhVphA
-#define OFF_AC_POWER    20    // 40092-40093  W
-#define OFF_DC_CURRENT  32    // 40104-40105  DCA
-#define OFF_DC_VOLTAGE  34    // 40106-40107  DCV
-#define OFF_DC_POWER    36    // 40108-40109  DCW
-#define OFF_STATE       46    // 40118        St  (uint16, 1 reg)
+// ── OLED SSD1306 128x64 ───────────────────────────────────────
+#define OLED_WIDTH         128
+#define OLED_HEIGHT         64
+#define OLED_ADDR          0x3C
+#define OLED_RESET          -1
 
-// ── Nombres de estado operativo (SunSpec enum16) ──────────────
-const char* stateNames[] = {
-    "OFF",           // 1
-    "SLEEPING",      // 2
-    "STARTING",      // 3
-    "MPPT",          // 4  ← normal operation
-    "THROTTLED",     // 5
-    "SHUTTING_DOWN", // 6
-    "FAULT",         // 7
-    "STANDBY"        // 8
+// ── Objetos globales ──────────────────────────────────────────
+ModbusMaster modbus;
+SSD1306Wire display(0x3C, 12, 14);
+
+// ── Estructura de datos del inversor ─────────────────────────
+struct InverterData {
+    float    Idc1, Vdc1, Pdc1;    // DC string 1 [A, V, W]
+    float    Idc2, Vdc2, Pdc2;    // DC string 2 [A, V, W]
+    float    PdcTotal;             // Potencia DC total [W]
+    float    Iac, Vac, Pac;        // AC [A, V, W]
+    uint16_t state;                // Estado SunSpec enum16
+    bool     valid;                // Ciclo de lectura exitoso
 };
 
-// ── Prototipos ────────────────────────────────────────────────
-uint16_t crc16(const uint8_t* buf, uint8_t len);
-bool     sendModbusRequest(uint8_t slaveId, uint16_t startReg, uint16_t numRegs);
-int      readModbusResponse(uint8_t* buf, uint16_t maxLen);
-float    regsToFloat(const uint8_t* buf, uint16_t byteOffset);
-uint16_t regsToUint16(const uint8_t* buf, uint16_t byteOffset);
-void     printResults(float acV, float acA, float acW,
-                      float dcV, float dcA, float dcW,
-                      uint16_t state);
+InverterData inv = {};
 
-// ── Buffers globales ──────────────────────────────────────────
-static uint8_t rxBuf[128];   // buffer de recepción Modbus
+// Scale factors Multiple MPPT (int16, sunsssf)
+// Valor por defecto -2 -> x0.01 (confirmado en TFG y mapa regs)
+int16_t sf_DCA = -2;
+int16_t sf_DCV = -2;
+int16_t sf_DCW = -2;
+
+// ── Prototipos ────────────────────────────────────────────────
+float       applyScaleFactor(uint16_t raw, int16_t sf);
+float       regsToFloat(uint16_t hi, uint16_t lo);
+bool        readMPPTScaleFactors();
+bool        readMPPTString(uint8_t str, float &I, float &V, float &P);
+bool        readACBlock();
+void        runReadCycle();
+void        updateOLED();
+void        printDebug();
+const char* stateStr(uint16_t st);
 
 // =============================================================
 void setup() {
-    // UART0 (Serial) → bus Modbus RTU exclusivamente (9600 8N1)
-    // UART1 (Serial1, GPIO2 TX-only) → debug a 115200 bps
+    // UART0 exclusivo para Modbus RTU (9600 8N1)
     Serial.begin(MODBUS_BAUD, SERIAL_8N1);
+
     DBG_BEGIN();
+    delay(300);
 
-    // Pequeña pausa para estabilizar la UART y el MAX3485
-    delay(200);
+    // Inicializar ModbusMaster sobre UART0.
+    // El modulo MAX3485 auto-direction no necesita callbacks
+    // preTransmission/postTransmission; controla DE/RE solo.
+    Serial.setTimeout(MODBUS_TIMEOUT_MS);
+    modbus.begin(MODBUS_ID, Serial);
+    
 
-    DBGLN("\n--- Fronius Primo Modbus RTU Reader ---");
-    DBG  ("Slave ID  : "); DBGLN(MODBUS_ID);
-    DBG  ("Start reg : "); DBGLN(REG_START_FRONIUS);
-    DBG  ("Num regs  : "); DBGLN(REG_COUNT);
-    DBGLN("Modulo MAX3485 auto-direction (sin pin DE/RE)");
-    DBGLN("---------------------------------------\n");
-    delay(200);
+    // OLED: SDA=GPIO4(D2), SCL=GPIO5(D1)
+    Wire.begin(12, 14);
+    
+    display.init();
+    display.flipScreenVertically();
+    display.setTextAlignment(TEXT_ALIGN_CENTER);
+    display.setFont(ArialMT_Plain_10);
+    display.clear();
+
+    display.drawString(0, 0, "Fronius Primo");
+    display.drawString(0, 12, "Modbus RTU");
+    display.drawString(0, 26, "ID Modbus: " + String(MODBUS_ID));
+    display.drawString(0, 38, "Baud: " + String(MODBUS_BAUD));
+    display.drawString(0, 52, "Iniciando...");
+    display.display();
+
+    DBGLN("\n=== Fronius Primo RTU Reader ===");
+    DBGF("Modbus ID  : %d\n", MODBUS_ID);
+    DBGF("Baudrate   : %lu bps\n", MODBUS_BAUD);
+    DBGLN("MAX3485    : auto-direction (sin DE/RE externo)");
+    DBGLN("================================\n");
+
+    delay(1500);
 }
 
 // =============================================================
 void loop() {
     static uint32_t lastPoll = 0;
-    uint32_t now = millis();
+    if (millis() - lastPoll < POLL_INTERVAL_MS) return;
+    lastPoll = millis();
 
-    if (now - lastPoll < POLL_INTERVAL_MS) return;
-    lastPoll = now;
-
-    // 1) Enviar petición Modbus FC03
-    if (!sendModbusRequest(MODBUS_ID,
-                           REG_START_FRONIUS - 1,  // base-0
-                           REG_COUNT)) {
-        DBGLN("[ERROR] Fallo al enviar peticion Modbus");
-        return;
-    }
-
-    // 2) Esperar y leer respuesta
-    int rxLen = readModbusResponse(rxBuf, sizeof(rxBuf));
-
-    if (rxLen < 0) {
-        DBGLN("[ERROR] Timeout esperando respuesta del inversor");
-        return;
-    }
-
-    // 3) Validar respuesta mínima
-    // Estructura: [SlaveID][FC][ByteCount][Data...][CRC_L][CRC_H]
-    // ByteCount = REG_COUNT * 2 bytes
-    uint8_t expectedBytes = REG_COUNT * 2;
-    if (rxLen < (3 + expectedBytes + 2)) {
-        DBG("[ERROR] Respuesta demasiado corta: ");
-        DBG(rxLen); DBGLN(" bytes");
-        return;
-    }
-
-    // 4) Verificar CRC de la respuesta
-    uint16_t crcCalc = crc16(rxBuf, rxLen - 2);
-    uint16_t crcRecv = (uint16_t)rxBuf[rxLen - 1] << 8 |
-                       (uint16_t)rxBuf[rxLen - 2];
-    if (crcCalc != crcRecv) {
-        DBGLN("[ERROR] CRC incorrecto en respuesta");
-        return;
-    }
-
-    // 5) Verificar ID y función
-    if (rxBuf[0] != MODBUS_ID) {
-        DBGLN("[ERROR] Slave ID inesperado en respuesta");
-        return;
-    }
-    if (rxBuf[1] == 0x83) {
-        // El esclavo devolvió excepción Modbus
-        DBG("[ERROR] Excepcion Modbus, codigo: 0x");
-        DBGLN(rxBuf[2], HEX);
-        return;
-    }
-    if (rxBuf[1] != 0x03) {
-        DBGLN("[ERROR] Funcion Modbus inesperada en respuesta");
-        return;
-    }
-
-    // 6) Datos empiezan en byte 3 (índice 3 del buffer)
-    const uint8_t* data = &rxBuf[3];
-
-    // 7) Decodificar valores
-    // Cada float32 ocupa 4 bytes (2 registros × 2 bytes/registro).
-    // El Fronius usa big-endian (byte más significativo primero),
-    // igual que el estándar IEEE-754 sobre Modbus.
-    float acCurrent = regsToFloat(data, OFF_AC_CURRENT * 2);
-    float acVoltage = regsToFloat(data, OFF_AC_VOLTAGE * 2);
-    float acPower   = regsToFloat(data, OFF_AC_POWER   * 2);
-    float dcCurrent = regsToFloat(data, OFF_DC_CURRENT * 2);
-    float dcVoltage = regsToFloat(data, OFF_DC_VOLTAGE * 2);
-    float dcPower   = regsToFloat(data, OFF_DC_POWER   * 2);
-    uint16_t state  = regsToUint16(data, OFF_STATE     * 2);
-
-    // 8) Mostrar resultados
-    printResults(acVoltage, acCurrent, acPower,
-                 dcVoltage, dcCurrent, dcPower, state);
+    runReadCycle();
+    updateOLED();
+    printDebug();
 }
 
 // =============================================================
-//  CRC-16/IBM (Modbus CRC): polinomio 0xA001
+//  Ciclo completo: SF -> MPPT1 -> MPPT2 -> Bloque AC
 // =============================================================
-uint16_t crc16(const uint8_t* buf, uint8_t len) {
-    uint16_t crc = 0xFFFF;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)buf[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x0001) {
-                crc = (crc >> 1) ^ 0xA001;
-            } else {
-                crc >>= 1;
-            }
+void runReadCycle() {
+    inv.valid = false;
+
+    // Scale factors (si fallan, continua con valores por defecto)
+    if (!readMPPTScaleFactors()) {
+        DBGLN("[WARN] SF no leidos, usando sf=-2 (x0.01)");
+    }
+
+    // String 1 — obligatorio
+    if (!readMPPTString(1, inv.Idc1, inv.Vdc1, inv.Pdc1)) {
+        DBGLN("[ERR] Fallo MPPT1 — abortando ciclo");
+        return;
+    }
+
+    // String 2 — no fatal (puede haber un solo string activo)
+    if (!readMPPTString(2, inv.Idc2, inv.Vdc2, inv.Pdc2)) {
+        DBGLN("[WARN] Fallo MPPT2 — asumiendo 0");
+        inv.Idc2 = inv.Vdc2 = inv.Pdc2 = 0.0f;
+    }
+
+    inv.PdcTotal = inv.Pdc1 + inv.Pdc2;
+
+    // Bloque AC — obligatorio
+    if (!readACBlock()) {
+        DBGLN("[ERR] Fallo bloque AC — abortando ciclo");
+        return;
+    }
+
+    inv.valid = true;
+}
+
+// =============================================================
+//  Scale factors del modelo Multiple MPPT
+//  FC03, 3 registros desde 40265 (base-0)
+// =============================================================
+bool readMPPTScaleFactors() {
+    for (int r = 0; r < MAX_RETRIES; r++) {
+        uint8_t res = modbus.readHoldingRegisters(REG_MPPT_SF_BASE, 3);
+        if (res == ModbusMaster::ku8MBSuccess) {
+            sf_DCA = (int16_t)modbus.getResponseBuffer(0);
+            sf_DCV = (int16_t)modbus.getResponseBuffer(1);
+            sf_DCW = (int16_t)modbus.getResponseBuffer(2);
+            DBGF("[SF] DCA=%d DCV=%d DCW=%d\n", sf_DCA, sf_DCV, sf_DCW);
+            return true;
         }
+        DBGF("[SF] retry %d err=0x%02X\n", r + 1, res);
+        delay(150);
     }
-    return crc;
+    return false;
 }
 
 // =============================================================
-//  Construye y envía una petición Modbus FC03
-//  startReg: dirección base-0 del primer registro
-//  numRegs:  número de registros a leer
+//  Lectura de un string MPPT (I, V, P)
+//  str: 1 o 2   |   FC03, 3 registros contiguos
 // =============================================================
-bool sendModbusRequest(uint8_t slaveId, uint16_t startReg, uint16_t numRegs) {
-    uint8_t req[8];
-    req[0] = slaveId;
-    req[1] = 0x03;                    // FC03: Read Holding Registers
-    req[2] = (startReg >> 8) & 0xFF;  // Registro alto
-    req[3] =  startReg & 0xFF;        // Registro bajo
-    req[4] = (numRegs  >> 8) & 0xFF;  // Cantidad alta
-    req[5] =  numRegs  & 0xFF;        // Cantidad baja
-    uint16_t crc = crc16(req, 6);
-    req[6] = crc & 0xFF;              // CRC bajo (primero en Modbus)
-    req[7] = (crc >> 8) & 0xFF;       // CRC alto
+bool readMPPTString(uint8_t str, float &I, float &V, float &P) {
+    uint16_t base = (str == 1) ? REG_MPPT1_BASE : REG_MPPT2_BASE;
 
-    // Limpiar buffer de entrada antes de transmitir
-    while (Serial.available()) Serial.read();
+    for (int r = 0; r < MAX_RETRIES; r++) {
+        uint8_t res = modbus.readHoldingRegisters(base, 3);
+        if (res == ModbusMaster::ku8MBSuccess) {
+            uint16_t rawI = modbus.getResponseBuffer(0);
+            uint16_t rawV = modbus.getResponseBuffer(1);
+            uint16_t rawW = modbus.getResponseBuffer(2);
 
-    // El módulo auto-direction activa TX automáticamente al escribir.
-    // No se necesita control manual de DE/RE.
-    Serial.write(req, 8);
-    Serial.flush();  // esperar a que se vacíe el buffer TX por hardware
+            // 0xFFFF = dato invalido (arranque/parada)
+            // Documentado en TFG seccion 5.6 y mapa de registros
+            I = (rawI == 0xFFFF) ? 0.0f : applyScaleFactor(rawI, sf_DCA);
+            V = (rawV == 0xFFFF) ? 0.0f : applyScaleFactor(rawV, sf_DCV);
+            P = (rawW == 0xFFFF) ? 0.0f : applyScaleFactor(rawW, sf_DCW);
 
-    // Guardar silencio t3.5 para que el módulo vuelva a modo RX
-    // y el esclavo reconozca el fin de trama antes de responder.
-    delayMicroseconds(MODBUS_T35_US);
-
-    return true;
-}
-
-// =============================================================
-//  Lee la respuesta Modbus del esclavo
-//  Retorna número de bytes leídos, o -1 en timeout
-// =============================================================
-int readModbusResponse(uint8_t* buf, uint16_t maxLen) {
-    uint16_t idx = 0;
-    uint32_t start = millis();
-    uint32_t lastByte = start;
-
-    while (true) {
-        // Timeout global
-        if ((millis() - start) > MODBUS_TIMEOUT_MS) {
-            return (idx > 0) ? (int)idx : -1;
+            DBGF("[MPPT%d] I=%.3fA V=%.2fV P=%.1fW\n", str, I, V, P);
+            return true;
         }
-
-        if (Serial.available()) {
-            if (idx < maxLen) {
-                buf[idx++] = (uint8_t)Serial.read();
-                lastByte = millis();
-            } else {
-                Serial.read();  // descartar si el buffer está lleno
-            }
-        } else {
-            // Detectar fin de trama: silencio > t3.5 DESPUÉS de haber
-            // recibido al menos el header (3 bytes mínimo)
-            if (idx >= 3) {
-                uint32_t elapsed = millis() - lastByte;
-                // A 9600 bps t3.5 ≈ 4 ms
-                if (elapsed > 5) break;
-            }
-        }
+        DBGF("[MPPT%d] retry %d err=0x%02X\n", str, r + 1, res);
+        delay(150);
     }
-    return (int)idx;
+    return false;
 }
 
 // =============================================================
-//  Convierte 4 bytes big-endian a float32 (IEEE-754)
-//  byteOffset: posición en el buffer de datos (sin header Modbus)
+//  Bloque AC: 47 registros desde 40071 (base-0)
+//  Decodifica float32 big-endian y el estado uint16
 // =============================================================
-float regsToFloat(const uint8_t* buf, uint16_t byteOffset) {
-    // Modbus entrega los bytes en big-endian:
-    // buf[off+0] = byte más significativo de la palabra alta
-    // buf[off+1] = byte menos significativo de la palabra alta
-    // buf[off+2] = byte más significativo de la palabra baja
-    // buf[off+3] = byte menos significativo de la palabra baja
-    // Esto coincide directamente con IEEE-754 big-endian.
-    uint32_t raw = ((uint32_t)buf[byteOffset    ] << 24) |
-                   ((uint32_t)buf[byteOffset + 1] << 16) |
-                   ((uint32_t)buf[byteOffset + 2] <<  8) |
-                   ((uint32_t)buf[byteOffset + 3]);
+bool readACBlock() {
+    for (int r = 0; r < MAX_RETRIES; r++) {
+        uint8_t res = modbus.readHoldingRegisters(REG_AC_BASE, REG_AC_COUNT);
+        if (res == ModbusMaster::ku8MBSuccess) {
+            // float32: word alto en offset N, word bajo en N+1
+            inv.Iac   = regsToFloat(
+                modbus.getResponseBuffer(OFF_AC_CURRENT),
+                modbus.getResponseBuffer(OFF_AC_CURRENT + 1));
+            inv.Vac   = regsToFloat(
+                modbus.getResponseBuffer(OFF_AC_VOLTAGE),
+                modbus.getResponseBuffer(OFF_AC_VOLTAGE + 1));
+            inv.Pac   = regsToFloat(
+                modbus.getResponseBuffer(OFF_AC_POWER),
+                modbus.getResponseBuffer(OFF_AC_POWER + 1));
+            inv.state = modbus.getResponseBuffer(OFF_STATE);
+
+            DBGF("[AC] I=%.3fA V=%.2fV P=%.1fW St=%s\n",
+                 inv.Iac, inv.Vac, inv.Pac, stateStr(inv.state));
+            return true;
+        }
+        DBGF("[AC] retry %d err=0x%02X\n", r + 1, res);
+        delay(150);
+    }
+    return false;
+}
+
+// =============================================================
+//  Scale factor SunSpec: valor_fisico = raw * 10^sf
+// =============================================================
+float applyScaleFactor(uint16_t raw, int16_t sf) {
+    float v = (float)raw;
+    if (sf >= 0) {
+        for (int i = 0; i < sf;  i++) v *= 10.0f;
+    } else {
+        for (int i = 0; i < -sf; i++) v *= 0.1f;
+    }
+    return v;
+}
+
+// =============================================================
+//  Reconstruir float32 IEEE-754 big-endian desde dos uint16
+// =============================================================
+float regsToFloat(uint16_t hi, uint16_t lo) {
+    uint32_t raw = ((uint32_t)hi << 16) | (uint32_t)lo;
     float f;
     memcpy(&f, &raw, sizeof(f));
     return f;
 }
 
 // =============================================================
-//  Convierte 2 bytes big-endian a uint16
+//  Nombre del estado SunSpec enum16
 // =============================================================
-uint16_t regsToUint16(const uint8_t* buf, uint16_t byteOffset) {
-    return ((uint16_t)buf[byteOffset] << 8) | buf[byteOffset + 1];
+const char* stateStr(uint16_t st) {
+    switch (st) {
+        case 1: return "OFF";
+        case 2: return "SLEEPING";
+        case 3: return "STARTING";
+        case 4: return "MPPT";
+        case 5: return "THROTTLE";
+        case 6: return "SHUTTING";
+        case 7: return "FAULT";
+        case 8: return "STANDBY";
+        default: return "UNKNOWN";
+    }
 }
 
 // =============================================================
-//  Imprime los resultados en formato legible
+//  OLED — 128x64, text size 1 (6x8 px), 8 filas disponibles
 // =============================================================
-void printResults(float acV, float acA, float acW,
-                  float dcV, float dcA, float dcW,
-                  uint16_t state) {
-    const char* stateName = "UNKNOWN";
-    if (state >= 1 && state <= 8) {
-        stateName = stateNames[state - 1];
+void updateOLED() {
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+
+    if (!inv.valid) {
+        display.drawString(0, 0, "FRONIUS PRIMO");
+        display.drawLine(0, 11, 127, 11);
+        display.drawString(0, 14, "Sin respuesta");
+        display.drawString(0, 28, "Modbus ID: " + String(MODBUS_ID));
+        display.drawString(0, 42, "Comprobar:");
+        display.drawString(0, 54, "GND / ID / cables");
+        display.display();
+        return;
     }
 
+    // Cabecera
+    display.drawString(0, 0, "FRONIUS  " + String(stateStr(inv.state)));
+    display.drawLine(0, 11, 127, 11);
+
+    // DC Strings
+    display.drawString(0, 12, "S1 " + String(inv.Idc1, 1) + "A " + String(inv.Vdc1, 0) + "V");
+    display.drawString(0, 22, "S2 " + String(inv.Idc2, 1) + "A " + String(inv.Vdc2, 0) + "V");
+    display.drawString(0, 32, "Pdc " + String(inv.PdcTotal, 0) + " W");
+
+    display.drawLine(0, 43, 127, 43);
+
+    // AC Data
+    display.drawString(0, 45, "Pac " + String(inv.Pac, 0) + " W");
+    display.drawString(0, 54, "V " + String(inv.Vac, 1) + "V  I " + String(inv.Iac, 2) + "A");
+
+    display.display();
+}
+
+// =============================================================
+//  Resultados por Serial1 (debug)
+// =============================================================
+void printDebug() {
     DBGLN("========================================");
-    DBG  ("[Estado] "); DBG(state);
-    DBG  (" - ");       DBGLN(stateName);
+    if (!inv.valid) {
+        DBGLN("[ERROR] Ciclo de lectura fallido");
+        DBGLN("========================================\n");
+        return;
+    }
+    DBGF("[Estado]   %d - %s\n", inv.state, stateStr(inv.state));
+    DBGLN("--- DC String 1 ---");
+    DBGF("  I : %.3f A\n", inv.Idc1);
+    DBGF("  V : %.2f V\n", inv.Vdc1);
+    DBGF("  P : %.1f W\n", inv.Pdc1);
+    DBGLN("--- DC String 2 ---");
+    DBGF("  I : %.3f A\n", inv.Idc2);
+    DBGF("  V : %.2f V\n", inv.Vdc2);
+    DBGF("  P : %.1f W\n", inv.Pdc2);
+    DBGF("  Pdc Total: %.1f W\n", inv.PdcTotal);
     DBGLN("--- AC ---");
-    DBG  ("  Tension  : "); DBG(acV, 2); DBGLN(" V");
-    DBG  ("  Corriente: "); DBG(acA, 3); DBGLN(" A");
-    DBG  ("  Potencia : "); DBG(acW, 1); DBGLN(" W");
-    DBGLN("--- DC ---");
-    DBG  ("  Tension  : "); DBG(dcV, 2); DBGLN(" V");
-    DBG  ("  Corriente: "); DBG(dcA, 3); DBGLN(" A");
-    DBG  ("  Potencia : "); DBG(dcW, 1); DBGLN(" W");
+    DBGF("  I : %.3f A\n", inv.Iac);
+    DBGF("  V : %.2f V\n", inv.Vac);
+    DBGF("  P : %.1f W\n", inv.Pac);
     DBGLN("========================================\n");
 }
