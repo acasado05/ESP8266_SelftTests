@@ -29,10 +29,17 @@ void setup() {
   delay(1000); // Pequeña pausa para asegurar que el monitor serial esté listo
 
   wifiSetUp();
-  delay(5000); // Espera un poco para que la conexión Wi-Fi se establezca
 
+  /* Espera activa */
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  delay(2000); // Espera un poco para que la conexión Wi-Fi se establezca
+
+  setNTP();  // Configura el NTP para sincronizar la hora
   pinMode(LED_BUILTIN, OUTPUT);
-  setNTP();         // Configura el NTP para sincronizar la hora
   pruebaConexion(); // Llama a la función de prueba de conexión
 }
 
@@ -41,10 +48,12 @@ void loop() {
   blinkLed(1000);
 
   unsigned long actualMillis = millis();
+  
   if (actualMillis - anteriorMillisHora >= intervaloHora) {
     anteriorMillisHora = actualMillis;
     
     if (WiFi.status() == WL_CONNECTED) {
+      
       Serial.print(F("Timestamp -> "));
       Serial.println(getTimeStamp());
     }
@@ -67,7 +76,7 @@ void pruebaConexion() {
 }
 
 void wifiSetUp() {
-  Serial.print("Conectando a: ");
+  Serial.print("\nConectando a: ");
   Serial.println(ssid);
   WiFi.hostname("ESP32_t0rt1s");
   WiFi.mode(WIFI_STA);
