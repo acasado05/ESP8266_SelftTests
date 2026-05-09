@@ -11,6 +11,7 @@
 #define HUAWEI_ID    1      // Por defecto los inversores Huawei usan el ID 1
 #define BAUDRATE     9600   //
 #define TIMEOUT_MS   1500   // Huawei a veces tarda un poco más en responder
+#define POLL_INTERVAL 10000   // Intervalo de lectura cada 5 segundos
 
 // ── Registros Clave (Función 0x03 - Holding Registers) ─────────────────────
 // Nota: Algunos mapas de registros requieren restar 1 a la dirección
@@ -47,7 +48,7 @@ void setup() {
 }
 
 void loop() {
-    if (millis() - lastMillis > 5000) { // Lectura cada 5 segundos
+    if (millis() - lastMillis > POLL_INTERVAL) { // Lectura cada 10 segundos
         lastMillis = millis();
         readHuaweiInverter();
         logHuaweiFormat();
