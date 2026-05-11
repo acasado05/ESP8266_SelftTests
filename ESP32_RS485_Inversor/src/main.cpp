@@ -2,7 +2,7 @@
 
 #define DEBUG_MODE  true
 
-// ── Pines de hardware (Asegúrate de mantener el divisor de tensión en RX) ───
+// ── Pines de hardware  ───
 #define RS485_TX    17    // GPIO17 -> Módulo DI
 #define RS485_RX    16    // GPIO16 <- Módulo RO
 #define RE_DE_PIN   4     // GPIO4  -> Control RE_DE
@@ -113,14 +113,14 @@ void readHuaweiInverter() {
  * Calcula el CRC-16 para Modbus RTU.
  * @param data Puntero al array de datos.
  * @param len Longitud de los datos.
- * @return Valor del CRC-16 calculado. [cite: 8, 12]
+ * @return Valor del CRC-16 calculado.
  */
 uint16_t crc16(const uint8_t *data, uint8_t len) {
-  uint16_t crc = 0xFFFF; // Inicialización del registro CRC [cite: 8]
+  uint16_t crc = 0xFFFF; // Inicialización del registro CRC
   for (uint8_t i = 0; i < len; i++) {
-    crc ^= (uint16_t)data[i]; // Operación XOR con el byte de datos [cite: 9]
+    crc ^= (uint16_t)data[i]; // Operación XOR con el byte de datos
     for (uint8_t b = 0; b < 8; b++) {
-      // Desplazamiento y aplicación del polinomio 0xA001 si el bit LSB es 1 [cite: 10, 11]
+      // Desplazamiento y aplicación del polinomio 0xA001 si el bit LSB es 1
       crc = (crc & 0x0001) ? (crc >> 1) ^ 0xA001 : (crc >> 1);
     }
   }
@@ -131,22 +131,22 @@ uint16_t crc16(const uint8_t *data, uint8_t len) {
  * Lee la respuesta del bus serie aplicando un filtro para el ruido inicial.
  * @param buf Buffer donde se almacenará la respuesta.
  * @param maxLen Capacidad máxima del buffer.
- * @return Número de bytes leídos. [cite: 22, 23]
+ * @return Número de bytes leídos.
  */
 uint8_t readModbusResponse(uint8_t *buf, uint8_t maxLen) {
   uint32_t t0 = millis();
   uint8_t idx = 0;
   
-  // Esperar a que el primer byte esté disponible o se agote el tiempo [cite: 24]
+  // Esperar a que el primer byte esté disponible o se agote el tiempo
   while (!Serial2.available()) {
     if (millis() - t0 > TIMEOUT_MS) {
       if (DEBUG_MODE) Serial.println(F("  [RX] TIMEOUT — sin respuesta"));
-      return 0; // Retorna 0 si hay timeout [cite: 25]
+      return 0; // Retorna 0 si hay timeout
     }
   }
 
   t0 = millis();
-  // Lectura de la trama completa [cite: 26]
+  // Lectura de la trama completa
   while (millis() - t0 < TIMEOUT_MS) {
     if (Serial2.available()) {
       uint8_t c = Serial2.read();
@@ -155,9 +155,9 @@ uint8_t readModbusResponse(uint8_t *buf, uint8_t maxLen) {
       if (idx == 0 && c == 0x00) continue; 
 
       if (idx < maxLen) buf[idx++] = c;
-      t0 = millis(); // Reiniciar contador de tiempo tras recibir byte [cite: 28]
+      t0 = millis(); // Reiniciar contador de tiempo tras recibir byte
     }
-    // Si hay un silencio de más de 4ms, se considera fin de trama Modbus [cite: 29]
+    // Si hay un silencio de más de 4ms, se considera fin de trama Modbus
     if (idx > 0 && !Serial2.available() && (millis() - t0 > 4)) break;
   }
 
@@ -170,12 +170,12 @@ uint8_t readModbusResponse(uint8_t *buf, uint8_t maxLen) {
 }
 
 /**
- * Valida la integridad de la trama recibida (ID, Código de función y CRC). [cite: 31]
+ * Valida la integridad de la trama recibida (ID, Código de función y CRC).
  */
 bool validateResponse(const uint8_t *buf, uint8_t len, uint8_t expectedId, uint8_t expectedFc) {
-  if (len < 5) return false; // Una trama Modbus válida tiene al menos 5 bytes [cite: 32]
+  if (len < 5) return false; // Una trama Modbus válida tiene al menos 5 bytes 
 
-  // Verificar el CRC de la trama recibida [cite: 33]
+  // Verificar el CRC de la trama recibida
   uint16_t crcCalc = crc16(buf, len - 2);
   uint16_t crcRecv = (uint16_t)buf[len-2] | ((uint16_t)buf[len-1] << 8);
   if (crcCalc != crcRecv) {
@@ -183,23 +183,23 @@ bool validateResponse(const uint8_t *buf, uint8_t len, uint8_t expectedId, uint8
     return false;
   }
 
-  // Comprobar que el ID del esclavo coincide [cite: 35]
+  // Comprobar que el ID del esclavo coincide
   if (buf[0] != expectedId) return false;
 
-  // Comprobar si hay una excepción Modbus (bit MSB del código de función) [cite: 36]
+  // Comprobar si hay una excepción Modbus (bit MSB del código de función)
   if (buf[1] & 0x80) {
     if (DEBUG_MODE) Serial.printf("  [ERR] Excepción Modbus: 0x%02X\n", buf[2]);
     return false;
   }
 
-  // Verificar que el código de función es el esperado [cite: 38]
+  // Verificar que el código de función es el esperado
   if (buf[1] != expectedFc) return false;
 
   return true;
 }
 
 /**
- * Imprime un buffer en formato hexadecimal para depuración. [cite: 13]
+ * Imprime un buffer en formato hexadecimal para depuración.
  */
 void printHex(const uint8_t *buf, uint8_t len) {
   for (uint8_t i = 0; i < len; i++) {
