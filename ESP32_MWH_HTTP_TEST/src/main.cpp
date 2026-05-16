@@ -4,99 +4,139 @@
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
 
-// --- Credenciales WiFi ---
-const char* ssid = "T0rt1s_A54";
-const char* password = "tortis007";
-const char* esiosToken = "TU_TOKEN_AQUÍ";
+// --- Credenciales ---
+const char* ssid = "MOVISTAR_1D80";
+const char* password = "nhM9ing7k4793YnX74ni";
+const char* esiosToken = "76f5317763cf71beec91ede16a667d8428e1ff3b793d45665a3c803e5ea5e68e";
 
-// --- DNS de Google (Crucial para evitar el error DNS Failed) ---
-IPAddress primaryDNS(8, 8, 8, 8);
-IPAddress secondaryDNS(8, 8, 4, 4);
+// -- Configuración NTP y Zona Horaria (Madrid) ---
+const char* ntpServer = "pool.ntp.org";
+const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 
-// --- Variables de Control ---
+// URL Real del Indicador 1001 (Tarifa 2.0TD) filtrado para la Península
+const char* urlEsios = "https://api.esios.ree.es/indicators/1001?start_date=2026-05-16T00:00:00Z&end_date=2026-05-16T23:59:59Z&geo_ids[]=8741";
+
+// --- Temporizador (10 minutos) ---
 unsigned long lastTimeRequest = 0;
-const unsigned long timerDelay = 600000; // 10 minutos
+const unsigned long timerDelay = 600000; 
 float precioActualKWh = 0.0;
 
-void obtenerPrecioOficial() {
+void obtenerPrecioESIOS() {
     if (WiFi.status() != WL_CONNECTED) return;
 
+    //Obtención hora y fecha actual
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("[TIME] Error: No se pudo obtener la hora local");
+        return;
+    }
+
+    //Formateo de la fecha actual
+    char fechaHoy[11];
+    strftime(fechaHoy, sizeof(fechaHoy), "%Y-%m-%d", &timeinfo);
+
+    //Construimos URL dinámica para el día actual
+    String urlDinamica = "https://api.esios.ree.es/indicators/1001?start_date=";
+    urlDinamica += String(fechaHoy) + "T00:00:00Z&end_date=";
+    urlDinamica += String(fechaHoy) + "T23:59:59Z&geo_ids[]=8741";
+
+    Serial.print("\n[ESIOS] Consultando URL: ");
+    Serial.println(urlDinamica);
+
     WiFiClientSecure *client = new WiFiClientSecure;
-    client->setInsecure();
+    client->setInsecure(); // Omitimos certificados pesados para proteger la RAM
 
     HTTPClient http;
+    http.begin(*client, urlEsios);
     
-    // Consultamos el indicador 1013 (PVPC)
-    // Usamos api.esios.ree.es (Dominio oficial de Red Eléctrica)
-    http.begin(*client, "https://api.esios.ree.es/indicators/1013");
-    
-    // Headers obligatorios para ESIOS
+    // --- Cabeceras Oficiales Verificadas ---
+    http.addHeader("x-api-key", esiosToken); 
     http.addHeader("Accept", "application/json; application/vnd.esios-api.v1+json");
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("x-token-auth", esiosToken);
+    http.addHeader("User-Agent", "ESP32-DevKitV1-Client");
 
     int httpResponseCode = http.GET();
 
     if (httpResponseCode == 200) {
-        String payload = http.getString();
+        // Filtramos el flujo en tiempo real: extraemos solo el valor numérico
+        JsonDocument filter;
+        filter["indicator"]["values"][0]["value"] = true;
+        filter["indicator"]["values"][0]["datetime"] = true;
+
         JsonDocument doc;
-        deserializeJson(doc, payload);
+        DeserializationError error = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
 
-        // ESIOS devuelve muchos datos, cogemos el último valor (el más actual)
-        JsonArray values = doc["indicator"]["values"];
-        float precioMWh = values[values.size() - 1]["value"]; 
-        float precioKWh = precioMWh / 1000.0;
+        if (!error) {
+            JsonArray values = doc["indicator"]["values"];
 
-        Serial.printf("\n[ESIOS] Precio oficial Red Eléctrica: %.4f €/kWh\n", precioKWh);
+            char patronHora[10];
+            snprintf(patronHora, sizeof(patronHora), "T%02d:00:00", timeinfo.tm_hour);
+            
+            bool encontrado = false;
+
+            for (JsonObject v : values) {
+                const char* datetimeStr = v["datetime"];
+                
+                if (datetimeStr != NULL && strstr(datetimeStr, patronHora) != NULL) {
+                    float precioMWh = v["value"];
+                    precioActualKWh = precioMWh / 1000.0;
+                    encontrado = true;
+                    break; // Salimos del bucle al encontrar la hora exacta
+                }
+            }
+            
+            if (encontrado) {
+                Serial.println("====================================");
+                Serial.printf(" HORA LOCAL: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                Serial.printf(" PRECIO FILTRADO PVPC: %.4f €/kWh\n", precioActualKWh);
+                Serial.println("====================================");
+            } else {
+                Serial.printf("[ESIOS] Tramo '%s' no disponible en el JSON todavía.\n", patronHora);
+            }
+
+        } else {
+            Serial.printf("[JSON] Error de parseo: %s\n", error.c_str());
+        }
     } else {
-        Serial.printf("[ESIOS] Error: %d\n", httpResponseCode);
+        Serial.printf("[HTTP] Error ESIOS: %d\n", httpResponseCode);
     }
-    
+
     http.end();
-    delete client;
+    delete client; // Liberación estricta de memoria
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
     
     WiFi.begin(ssid, password);
-    Serial.print("[WIFI] Conectando");
-
+    Serial.print("Conectando Wi-Fi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
-
     Serial.println("\n[WIFI] ¡Conectado!");
-    Serial.print("[WIFI] IP asignada por el router: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] Puerta de enlace (Gateway): ");
-    Serial.println(WiFi.gatewayIP());
-    Serial.print("[WIFI] DNS Principal: ");
-    Serial.println(WiFi.dnsIP()); // Vamos a ver qué DNS te da el router por defecto
 
-    // Prueba de fuego: ¿Podemos resolver una IP de Google?
-    IPAddress apiIP;
-    if (WiFi.hostByName("api.preciodelaluz.org", apiIP)) {
-      Serial.print("[DNS] ¡API Localizada! IP: ");
-      Serial.println(apiIP);
-    } else {
-      Serial.println("[DNS] La API sigue sin responder al nombre...");
+    Serial.println("[NTP] Sincronizando hora...");
+    configTzTime(TZ_INFO, ntpServer);
+
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo)) {
+        delay(500);
+        Serial.print(".");
     }
+    Serial.println("\n[NTP] Reloj del sistema sincronizado");
 
-    delay(2000);
-    obtenerPrecioLuz();
+    // Primera consulta al iniciar
+    obtenerPrecioESIOS();
+    lastTimeRequest = millis();
 }
 
 void loop() {
     unsigned long currentMillis = millis();
 
-    // Temporizador no bloqueante
+    // Cronómetro no bloqueante de 10 minutos
     if (currentMillis - lastTimeRequest >= timerDelay) {
         lastTimeRequest = currentMillis;
-        obtenerPrecioLuz();
+        obtenerPrecioESIOS();
     }
-
-    // El resto de tu hardware (Inversor, ADS1115) iría aquí abajo
 }
