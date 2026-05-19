@@ -3,18 +3,16 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
+#include <time.h> 
 
 // --- Credenciales ---
-const char* ssid = "MOVISTAR_1D80";
-const char* password = "nhM9ing7k4793YnX74ni";
+const char* ssid = "T0rt1s_A54";
+const char* password = "tortis007";
 const char* esiosToken = "76f5317763cf71beec91ede16a667d8428e1ff3b793d45665a3c803e5ea5e68e";
 
 // -- Configuración NTP y Zona Horaria (Madrid) ---
 const char* ntpServer = "pool.ntp.org";
 const char* TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
-
-// URL Real del Indicador 1001 (Tarifa 2.0TD) filtrado para la Península
-const char* urlEsios = "https://api.esios.ree.es/indicators/1001?start_date=2026-05-16T00:00:00Z&end_date=2026-05-16T23:59:59Z&geo_ids[]=8741";
 
 // --- Temporizador (10 minutos) ---
 unsigned long lastTimeRequest = 0;
@@ -24,18 +22,18 @@ float precioActualKWh = 0.0;
 void obtenerPrecioESIOS() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    //Obtención hora y fecha actual
+    // Obtención hora y fecha actual
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
         Serial.println("[TIME] Error: No se pudo obtener la hora local");
         return;
     }
 
-    //Formateo de la fecha actual
+    // Formateo de la fecha actual
     char fechaHoy[11];
     strftime(fechaHoy, sizeof(fechaHoy), "%Y-%m-%d", &timeinfo);
 
-    //Construimos URL dinámica para el día actual
+    // Construimos URL dinámica para el día actual
     String urlDinamica = "https://api.esios.ree.es/indicators/1001?start_date=";
     urlDinamica += String(fechaHoy) + "T00:00:00Z&end_date=";
     urlDinamica += String(fechaHoy) + "T23:59:59Z&geo_ids[]=8741";
@@ -47,18 +45,19 @@ void obtenerPrecioESIOS() {
     client->setInsecure(); // Omitimos certificados pesados para proteger la RAM
 
     HTTPClient http;
-    http.begin(*client, urlEsios);
+    // --- CORRECCIÓN CRUCIAL ---
+    // Usamos urlDinamica en lugar de la constante urlEsios estática
+    http.begin(*client, urlDinamica); 
     
     // --- Cabeceras Oficiales Verificadas ---
     http.addHeader("x-api-key", esiosToken); 
     http.addHeader("Accept", "application/json; application/vnd.esios-api.v1+json");
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("User-Agent", "ESP32-DevKitV1-Client");
+    http.addHeader("User-Agent", "ESP32-S3-Client");
 
     int httpResponseCode = http.GET();
 
     if (httpResponseCode == 200) {
-        // Filtramos el flujo en tiempo real: extraemos solo el valor numérico
         JsonDocument filter;
         filter["indicator"]["values"][0]["value"] = true;
         filter["indicator"]["values"][0]["datetime"] = true;
@@ -81,13 +80,13 @@ void obtenerPrecioESIOS() {
                     float precioMWh = v["value"];
                     precioActualKWh = precioMWh / 1000.0;
                     encontrado = true;
-                    break; // Salimos del bucle al encontrar la hora exacta
+                    break; 
                 }
             }
             
             if (encontrado) {
                 Serial.println("====================================");
-                Serial.printf(" HORA LOCAL: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+                Serial.printf(" HORA LOCAL DEL S3: %02d:%02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
                 Serial.printf(" PRECIO FILTRADO PVPC: %.4f €/kWh\n", precioActualKWh);
                 Serial.println("====================================");
             } else {
@@ -102,19 +101,43 @@ void obtenerPrecioESIOS() {
     }
 
     http.end();
-    delete client; // Liberación estricta de memoria
+    delete client; 
 }
 
 void setup() {
     Serial.begin(115200);
+    
+    // Configuramos el LED interno (En las placas oficiales suele ser el pin 48 o LED_BUILTIN)
+    #ifdef LED_BUILTIN
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH); // Encendemos el LED al arrancar
+    #endif
+
+    // Espera activa para el USB nativo
+    while (!Serial) {
+        delay(10); 
+    }
+    
+    // En cuanto abras el monitor, pasará de aquí y verás esto instantáneamente:
+    Serial.println("\n====================================");
+    Serial.println("[S3] ¡CONEXIÓN ESTABLECIDA CON EL PC!");
+    Serial.println("====================================");
     
     WiFi.begin(ssid, password);
     Serial.print("Conectando Wi-Fi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
+        // Hacemos parpadear el LED mientras busca WiFi
+        #ifdef LED_BUILTIN
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+        #endif
     }
     Serial.println("\n[WIFI] ¡Conectado!");
+    
+    #ifdef LED_BUILTIN
+    digitalWrite(LED_BUILTIN, LOW); // Apagamos el LED al conectar con éxito
+    #endif
 
     Serial.println("[NTP] Sincronizando hora...");
     configTzTime(TZ_INFO, ntpServer);
@@ -124,9 +147,8 @@ void setup() {
         delay(500);
         Serial.print(".");
     }
-    Serial.println("\n[NTP] Reloj del sistema sincronizado");
+    Serial.println("\n[NTP] Reloj sincronizado.");
 
-    // Primera consulta al iniciar
     obtenerPrecioESIOS();
     lastTimeRequest = millis();
 }
@@ -134,7 +156,6 @@ void setup() {
 void loop() {
     unsigned long currentMillis = millis();
 
-    // Cronómetro no bloqueante de 10 minutos
     if (currentMillis - lastTimeRequest >= timerDelay) {
         lastTimeRequest = currentMillis;
         obtenerPrecioESIOS();

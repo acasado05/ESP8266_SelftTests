@@ -14,12 +14,15 @@ const int internalAdcPin = 1;
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial);
+    
+    unsigned long start = millis();
+    while (!Serial && (millis() - start < 4000)) {
+        delay(10);
+    }
 
     // Inicializar I2C (ajusta pines si usas otros distintos al estándar)
     Wire.begin(sdaPin, sclPin); // SDA, SCL en ESP32-S3 (ejemplo común)
 
-    // Configurar ADS1115
     // GAIN_ONE: Rango +/- 4.096V (1 bit = 0.125mV)
     ads.setGain(GAIN_ONE); 
     if (!ads.begin()) {
@@ -27,7 +30,9 @@ void setup() {
         while (1);
     }
 
-    Serial.println("--- COMPARATIVA DE ADCs ---");
+    analogSetAttenuation(ADC_11db);
+
+    Serial.println("              --- COMPARATIVA DE ADCs ---               ");
     Serial.println("V_Fuente (Multímetro) | V_ESP32_S3 (mV) | V_ADS1115 (mV)");
 }
 
@@ -47,5 +52,5 @@ void loop() {
     Serial.print(v_ads, 2);
     Serial.println(" mV (ADS1115)");
 
-    delay(1000); // Una lectura por segundo para comparar con calma
+    delay(10000); // Una lectura por segundo para comparar con calma
 }

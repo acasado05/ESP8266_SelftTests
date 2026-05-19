@@ -25,9 +25,12 @@ unsigned long anteriorMillisBlink = 0;
 const int MUESTRAS_PROMEDIO = 20;
 
 // Credenciales WiFi
-const char* ssid     = "TP-LINK_C062";
-const char* password = "77817570";
+/*const char* ssid     = "TP-LINK_C062";
+const char* password = "77817570"; */
+const char* ssid     = "T0rt1s_A54";
+const char* password = "tortis007";
 const char* MY_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; // Zona horaria de Madrid
+
 
 // Prototipos
 void wifiSetUp();
@@ -61,19 +64,18 @@ void setup() {
     Serial.println("Error: No se encontró BMP280");
   }
   
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, estadoLed);
+  //pinMode(LED_BUILTIN, OUTPUT);
+  //digitalWrite(LED_BUILTIN, estadoLed);
 
   // Configuración de hora NTP
   setNTP();  // Configura el NTP para sincronizar la hora
-  pinMode(LED_BUILTIN, OUTPUT);
   pruebaConexion();
   Serial.println("\nSistema listo. Esperando sincronización horaria...");
 }
 
 void loop() {
   
-  blinkLed(1000); // El LED parpadea lento si hay WiFi
+  //blinkLed(1000); // El LED parpadea lento si hay WiFi
   unsigned long currentMillis = millis();
 
   if (currentMillis - anteriorMillisLog >= intervaloLog) {
@@ -83,7 +85,7 @@ void loop() {
           // Lógica principal: Ejecutar cada 1 minuto   
           logDatosSerial(); // Función que imprime datos por el puerto serie 
       } else {
-        blinkLed(100); // Parpadeo rápido si se pierde el WiFi
+        //blinkLed(100); // Parpadeo rápido si se pierde el WiFi
       }
     }
 }
