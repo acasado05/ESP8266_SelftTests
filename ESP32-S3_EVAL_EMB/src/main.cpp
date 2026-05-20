@@ -7,7 +7,7 @@
 #include "scaler_params.h"
 
 // Elegir modelo a usar
-#define USE_LSTM   // o #define USE_GRU
+#define USE_GRU   // o #define USE_LSTM
 
 #ifdef USE_LSTM
   #include "LSTM_model.h"
@@ -39,6 +39,7 @@ float window_buffer[SEQ_LENGTH][N_FEATURES];
 int   window_head   = 0;    // índice del paso más antiguo
 bool  window_full   = false;
 int   steps_received = 0;
+bool is_inferring = false;
 
 // ─── Variables de medición de latencia ────────────────────────────────
 uint32_t t_start_us, t_end_us;
@@ -83,6 +84,7 @@ bool init_tflite() {
 
 // ─── Añadir un paso temporal al buffer circular ────────────────────────
 void push_step(float* new_features) {
+    if (is_inferring) return;
     // 1. Calculamos dónde toca escribir el dato nuevo
     int tail_idx;
     if (!window_full) {
@@ -199,6 +201,7 @@ void loop() {
             return;
         }
 
+
         // 3. Normalizar features con el MinMaxScaler
         float norm_features[N_FEATURES];
         for (int i = 0; i < N_FEATURES; i++) {
@@ -215,8 +218,10 @@ void loop() {
             return;
         }
 
-        // 5. Ejecutar inferencia
+        is_inferring = true; // <--- BLOQUEO
         float prediccion = run_inference();
+        is_inferring = false; // <--- LIBERACIÓN
+        
         uint32_t latencia = t_end_us - t_start_us;
 
         // ─── AÑADIDO 2: Responder con el número de secuencia ───
