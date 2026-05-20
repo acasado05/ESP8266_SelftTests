@@ -82,13 +82,31 @@ bool init_tflite() {
 }
 
 // ─── Añadir un paso temporal al buffer circular ────────────────────────
-void push_step(float features[N_FEATURES]) {
-    for (int i = 0; i < N_FEATURES; i++) {
-        window_buffer[window_head][i] = features[i];
+void push_step(float* new_features) {
+    // 1. Calculamos dónde toca escribir el dato nuevo
+    int tail_idx;
+    if (!window_full) {
+        // Si aún nos estamos llenando, escribimos al final de los recibidos
+        tail_idx = steps_received;
+    } else {
+        // Si ya está lleno, sobrescribimos el dato más viejo (el head)
+        tail_idx = window_head;
+        // Y el head avanza un paso (dando la vuelta si llega al final)
+        window_head = (window_head + 1) % SEQ_LENGTH;
     }
-    window_head = (window_head + 1) % SEQ_LENGTH;
-    steps_received++;
-    if (steps_received >= SEQ_LENGTH) window_full = true;
+
+    // 2. Guardamos los 8 valores de la nueva fila
+    for (int f = 0; f < N_FEATURES; f++) {
+        window_buffer[tail_idx][f] = new_features[f];
+    }
+
+    // 3. (EL FIX QUE FALTABA) Avisar de que el buffer está listo
+    if (!window_full) {
+        steps_received++;
+        if (steps_received == SEQ_LENGTH) {
+            window_full = true;
+        }
+    }
 }
 
 // ─── Copiar ventana al tensor de entrada ──────────────────────────────
@@ -106,6 +124,11 @@ void fill_input_tensor() {
 // ─── Ejecutar inferencia y devolver predicción en W ───────────────────
 float run_inference() {
     fill_input_tensor();
+
+    Serial.printf("DEBUG_INP: %.2f, %.2f, %.2f\n", 
+    interpreter->input(0)->data.f[0], 
+    interpreter->input(0)->data.f[1], 
+    interpreter->input(0)->data.f[2]);
 
     t_start_us = micros();
     if (interpreter->Invoke() != kTfLiteOk) {
@@ -140,18 +163,26 @@ void setup() {
 // ─── Loop ─────────────────────────────────────────────────────────────
 void loop() {
     // Protocolo de comunicación con Python vía pyserial:
-    // Python envía una línea CSV con 8 valores float
-    // ESP32 responde con: prediccion_W,latencia_us
     if (Serial.available() > 0) {
         String line = Serial.readStringUntil('\n');
         line.trim();
 
+        // 1. Handshake inicial
         if (line == "PING") {
             Serial.println("PONG");
-            return; // Cortamos aquí para que no intente parsear esto como CSV
+            return; // Cortamos aquí
         }
 
-        // Parsear los 8 valores
+        // ─── AÑADIDO 1: Extraer el número de secuencia ───
+        int seq_num = -1;
+        if (line.startsWith("SEQ:")) {
+            int comma_pos = line.indexOf(',');
+            seq_num = line.substring(4, comma_pos).toInt();
+            line = line.substring(comma_pos + 1); // Quitamos el prefijo "SEQ:N," para que strtok no se rompa
+        }
+        // ──────────────────────────────────────────────────
+
+        // 2. Parsear los 8 valores (la línea ya está limpia)
         float raw_features[N_FEATURES];
         int   parsed = 0;
         char  buf[256];
@@ -168,14 +199,14 @@ void loop() {
             return;
         }
 
-        // Normalizar features con el MinMaxScaler
+        // 3. Normalizar features con el MinMaxScaler
         float norm_features[N_FEATURES];
         for (int i = 0; i < N_FEATURES; i++) {
             norm_features[i] = normalize(raw_features[i], i);
             norm_features[i] = constrain(norm_features[i], 0.0f, 1.0f);
         }
 
-        // Añadir al buffer circular
+        // 4. Añadir al buffer circular
         push_step(norm_features);
 
         if (!window_full) {
@@ -184,11 +215,16 @@ void loop() {
             return;
         }
 
-        // Ejecutar inferencia
+        // 5. Ejecutar inferencia
         float prediccion = run_inference();
         uint32_t latencia = t_end_us - t_start_us;
 
-        // Responder a Python
-        Serial.printf("PRED:%.2f,LAT:%lu\n", prediccion, latencia);
+        // ─── AÑADIDO 2: Responder con el número de secuencia ───
+        if (seq_num >= 0) {
+            Serial.printf("PRED:SEQ:%d:%.2f,LAT:%lu\n", seq_num, prediccion, (unsigned long)latencia);
+        } else {
+            Serial.printf("PRED:%.2f,LAT:%lu\n", prediccion, (unsigned long)latencia);
+        }
+        // ────────────────────────────────────────────────────────
     }
 }
