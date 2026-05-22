@@ -7,7 +7,7 @@
 #include "scaler_params.h"
 
 // Elegir modelo a usar
-#define USE_GRU   // o #define USE_LSTM
+#define USE_LSTM   // o #define USE_GRU
 
 #ifdef USE_LSTM
   #include "LSTM_model.h"
@@ -25,7 +25,7 @@
 // Tamaño del tensor arena — ajustar según el modelo
 // LSTM 32 unidades seq=18: ~80KB
 // GRU  32 unidades seq=18: ~60KB
-constexpr int TENSOR_ARENA_SIZE = 250 * 1024;  // 250 KB, ajustar si falla
+constexpr int TENSOR_ARENA_SIZE = 50 * 1024;  // Para la LSTM con 50 sobra, pero para la GRU hay que poner unos 70
 alignas(16) static uint8_t tensor_arena[TENSOR_ARENA_SIZE];
 
 static const tflite::Model* tfl_model = nullptr;
@@ -39,7 +39,6 @@ float window_buffer[SEQ_LENGTH][N_FEATURES];
 int   window_head   = 0;    // índice del paso más antiguo
 bool  window_full   = false;
 int   steps_received = 0;
-bool is_inferring = false;
 
 // ─── Variables de medición de latencia ────────────────────────────────
 uint32_t t_start_us, t_end_us;
@@ -74,6 +73,11 @@ bool init_tflite() {
         return false;
     }
 
+    size_t bytes_usados = interpreter->arena_used_bytes();
+    Serial.println("\n=======================================");
+    Serial.printf("[TinyML] TENSOR ARENA USADO: %u bytes\n", bytes_usados);
+    Serial.println("=======================================\n");
+
     input_tensor  = interpreter->input(0);
     output_tensor = interpreter->output(0);
 
@@ -84,30 +88,22 @@ bool init_tflite() {
 
 // ─── Añadir un paso temporal al buffer circular ────────────────────────
 void push_step(float* new_features) {
-    if (is_inferring) return;
-    // 1. Calculamos dónde toca escribir el dato nuevo
-    int tail_idx;
     if (!window_full) {
-        // Si aún nos estamos llenando, escribimos al final de los recibidos
-        tail_idx = steps_received;
-    } else {
-        // Si ya está lleno, sobrescribimos el dato más viejo (el head)
-        tail_idx = window_head;
-        // Y el head avanza un paso (dando la vuelta si llega al final)
-        window_head = (window_head + 1) % SEQ_LENGTH;
-    }
-
-    // 2. Guardamos los 8 valores de la nueva fila
-    for (int f = 0; f < N_FEATURES; f++) {
-        window_buffer[tail_idx][f] = new_features[f];
-    }
-
-    // 3. (EL FIX QUE FALTABA) Avisar de que el buffer está listo
-    if (!window_full) {
+        // Llenado inicial: escribir en posición steps_received
+        for (int f = 0; f < N_FEATURES; f++)
+            window_buffer[steps_received][f] = new_features[f];
         steps_received++;
         if (steps_received == SEQ_LENGTH) {
             window_full = true;
+            window_head = 0;  // el más antiguo es la posición 0
         }
+    } else {
+        // Buffer lleno: sobrescribir la posición más antigua (window_head)
+        // y avanzar head ANTES de escribir, no después
+        for (int f = 0; f < N_FEATURES; f++)
+            window_buffer[window_head][f] = new_features[f];
+        window_head = (window_head + 1) % SEQ_LENGTH;
+        // Ahora window_head apunta al siguiente más antiguo (correcto para fill)
     }
 }
 
@@ -126,11 +122,6 @@ void fill_input_tensor() {
 // ─── Ejecutar inferencia y devolver predicción en W ───────────────────
 float run_inference() {
     fill_input_tensor();
-
-    Serial.printf("DEBUG_INP: %.2f, %.2f, %.2f\n", 
-    interpreter->input(0)->data.f[0], 
-    interpreter->input(0)->data.f[1], 
-    interpreter->input(0)->data.f[2]);
 
     t_start_us = micros();
     if (interpreter->Invoke() != kTfLiteOk) {
@@ -218,9 +209,7 @@ void loop() {
             return;
         }
 
-        is_inferring = true; // <--- BLOQUEO
         float prediccion = run_inference();
-        is_inferring = false; // <--- LIBERACIÓN
         
         uint32_t latencia = t_end_us - t_start_us;
 
