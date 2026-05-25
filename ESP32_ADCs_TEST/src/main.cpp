@@ -66,7 +66,6 @@ void setup() {
     Wire.begin(sdaPin, sclPin); // SDA, SCL en ESP32-S3 (ejemplo común)
 
     // GAIN_ONE: Rango +/- 4.096V (1 bit = 0.125mV)
-    ads.setGain(GAIN_ONE); 
     if (!ads.begin()) {
         Serial.println("Fallo al iniciar el ADS1115. Revisa conexiones.");
         while (1);
@@ -81,6 +80,7 @@ void setup() {
     }
 
     analogSetAttenuation(ADC_11db);
+    ads.setGain(GAIN_EIGHT);
 }
 
 void loop() {
@@ -94,7 +94,7 @@ void loop() {
     /// 3. Enviar todo al monitor serie
     logDatosSerial(misMedidasAmb, misDatosFV);
 
-    delay(10000); // Una lectura por 10 segundos para comparar con calma
+    delay(4000); // Una lectura por 10 segundos para comparar con calma
 }
 
 MedidasAmbientales realizarMedida (void){
@@ -132,6 +132,8 @@ void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv)
     Serial.println("\n[Comparativa V_Shunt]");
     Serial.print("ESP32-S3 (ADC Interno)   : "); Serial.print(fv.V_shunt_ESP32, 4); Serial.println(" V");
     Serial.print("ADS1115 (ADC Externo)    : "); Serial.print(fv.V_shunt_ADS, 4); Serial.println(" V");
+    // Serial.print("LECTURA: "); Serial.print(fv.V_shunt_ESP32, 4); Serial.print(" V (ESP32) | "); 
+    // Serial.print(fv.V_shunt_ADS, 4); Serial.println(" V (ADS1115)");
     
     // Opcional: Mostrar el error absoluto
     float error = abs(fv.V_shunt_ESP32 - fv.V_shunt_ADS);
@@ -147,21 +149,26 @@ void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv)
 DatosFotovoltaicos calcularParametrosSolares(float ambTemp) {
     DatosFotovoltaicos datos;
     long sum_esp32_mV = 0;
-    float sum_ads_V = 0;
+    float sum_ads_mV = 0;
 
     // 1. Toma de muestras promediada de la MISMA señal
     for (int i = 0; i < NUM_MUESTRAS_ADC; i++) {
         sum_esp32_mV += analogReadMilliVolts(internalAdcPin);
         
-        int16_t results = ads.readADC_SingleEnded(0);
-        sum_ads_V += ads.computeVolts(results); 
+        //int16_t results = ads.readADC_SingleEnded(0);
+        int16_t results = ads.readADC_Differential_0_1();
+
+        sum_ads_mV += ads.computeVolts(results) * 1000.0f;
         
-        delay(2); 
+        delay(25); 
     }
 
+    float avg_esp32_mv = (float)sum_esp32_mV / NUM_MUESTRAS_ADC;
+    float avg_ads_mv   = sum_ads_mV / NUM_MUESTRAS_ADC;
+
     // 2. Promedios en Voltios
-    datos.V_shunt_ESP32 = ((float)sum_esp32_mV / NUM_MUESTRAS_ADC) / 1000.0;
-    datos.V_shunt_ADS   = sum_ads_V / NUM_MUESTRAS_ADC;
+    datos.V_shunt_ESP32 = avg_esp32_mv / 1000.0f;
+    datos.V_shunt_ADS   = avg_ads_mv / 1000.0f;
 
     // 3. Cálculos Fotovoltaicos (Usando el ADS1115 por su precisión)
     datos.Isc = datos.V_shunt_ADS / RSHUNT;
