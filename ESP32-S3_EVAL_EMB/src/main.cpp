@@ -7,7 +7,7 @@
 #include "scaler_params.h"
 
 // Elegir modelo a usar
-#define USE_GRU   // o #define USE_LSTM
+#define USE_LSTM   // o #define USE_LSTM
 
 #ifdef USE_LSTM
   #include "LSTM_model.h"
@@ -25,7 +25,7 @@
 // Tamaño del tensor arena — ajustar según el modelo
 // LSTM 32 unidades seq=18: ~80KB
 // GRU  32 unidades seq=18: ~60KB
-constexpr int TENSOR_ARENA_SIZE = 70 * 1024;  // Para la LSTM con 50 sobra, pero para la GRU hay que poner unos 70
+constexpr int TENSOR_ARENA_SIZE = 50 * 1024;  // Para la LSTM con 50 sobra, pero para la GRU hay que poner unos 70
 alignas(16) static uint8_t tensor_arena[TENSOR_ARENA_SIZE];
 
 static const tflite::Model* tfl_model = nullptr;

@@ -51,6 +51,7 @@ float circular_buffer[SEQ_LENGTH][N_FEATURES];
 String buffer_timestamps[SEQ_LENGTH];
 int buffer_count = 0;
 bool buffer_lleno = false;
+int window_head = 0;
 
 // --- Credenciales ---
 const char* ssid = "TP-LINK_C062";
@@ -68,9 +69,7 @@ float precioActualKWh = 0.0;
 
 // --- Temporizadores no bloqueantes ---
 unsigned long lastSerialTime = 0;
-unsigned long lastSDTime = 0;
-const unsigned long serialInterval = 10000; // 10 segundos
-const unsigned long sdInterval = 60000;     // 60 segundos (1 minuto)
+const unsigned long serialInterval = 600000; // 10 segundos
 
 // Sensores
 Adafruit_ADS1115 ads;
@@ -152,7 +151,7 @@ MedidasAmbientales realizarMedida(void);
 DatosFotovoltaicos calcularParametrosSolares(float ambTemp);
 DatosInversor leerInversorHuawei();
 void SDsetup();
-void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
+void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia);
 void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
 
 // Funciones auxiliares Modbus
@@ -226,7 +225,9 @@ void loop() {
       obtenerPrecioESIOS();
   }
 
-  // 2. Bloque principal: Dispara cada 10 segundos
+  // 2. Bloque principal unificado: Adquisición, IA y Guardado SD
+  // IMPORTANTE: Recuerda cambiar arriba en tus variables globales:
+  // const unsigned long serialInterval = 600000; // Para que dispare cada 10 minutos
   if (currentMillis - lastSerialTime >= serialInterval) {
     lastSerialTime = currentMillis;
 
@@ -238,8 +239,7 @@ void loop() {
     // Imprimir por Monitor Serie
     logDatosSerial(misMedidasAmb, misDatosFV, misDatosInv);
 
-      // Extraemos el mes (1-12) y la hora (0-23) del struct timeinfo (NTP)
-    // Nota: tm_mon va de 0 (Enero) a 11 (Diciembre), por lo que sumamos 1.
+    // Extraemos el mes (1-12) y la hora (0-23) del struct timeinfo (NTP)
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
         Serial.println("[IA WARNING] Fallo NTP. Usando hora por defecto.");
@@ -268,26 +268,22 @@ void loop() {
     // 5. Imprimir Matriz Completa
     debug_imprimir_buffer_completo();
 
+    // 6. INFERENCIA Y GUARDADO SINCRONIZADO EN SD
+    // Inicializamos a 0 por si el buffer aún no está lleno
+    float prediccion_W = 0.0f; 
+
     if (buffer_lleno) {
-        // Ejecutamos el modelo
-        float prediccion_W = ejecutar_inferencia_y_calibrar();
-        
-        // Aquí llamas a tu función de guardar en la MicroSD
-        // Ej: guardar_en_SD(etiqueta_actual, g_seguro, ta_seguro, tc_seguro, prediccion_W);
-        
+        // Ejecutamos el modelo y guardamos el resultado en la variable
+        prediccion_W = ejecutar_inferencia_y_calibrar();
     } else {
         Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
-        // Si quieres, aquí puedes guardar en la SD con predicción = 0.0
     }
 
-    // 3. Sub-bloque SD: Dispara cada 60 segundos (1 minuto)
-    if (currentMillis - lastSDTime >= sdInterval) {
-        lastSDTime = currentMillis;
-        
-        // Guardar en la tarjeta SD los mismos datos recién impresos
-        saveDataSD(misMedidasAmb, misDatosFV, misDatosInv);
-    }
-  }
+    // Guardar ABSOLUTAMENTE TODO en la tarjeta SD de una sola vez
+    // (Si el buffer se está llenando, guardará 0.0 W en la columna de IA)
+    saveDataSD(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
+
+  } // Fin del bloque principal
 }
 
 // --------------------------------------------------------
@@ -357,66 +353,56 @@ void procesar_y_normalizar(int mes, int hora, float g_glob, float ta, float hum_
 }
 
 void actualizar_buffer_circular(float nuevo_vector[N_FEATURES], String etiqueta_tiempo) {
-    
-    // 1. Desplazar el historial hacia el "pasado"
-    for (int i = 0; i < SEQ_LENGTH - 1; i++) {
-        for (int j = 0; j < N_FEATURES; j++) {
-            circular_buffer[i][j] = circular_buffer[i + 1][j];
-        }
-        buffer_timestamps[i] = buffer_timestamps[i + 1]; 
-    }
-    
-    // 2. Insertar el vector actual
-    for (int j = 0; j < N_FEATURES; j++) {
-        circular_buffer[SEQ_LENGTH - 1][j] = nuevo_vector[j];
-    }
-    
-    // 3. Usamos TU etiqueta de tiempo
-    buffer_timestamps[SEQ_LENGTH - 1] = etiqueta_tiempo;
-    
-    // 4. Gestionar el llenado
     if (!buffer_lleno) {
+        // Fase de cebado (Llenando las primeras 18 posiciones)
+        for (int f = 0; f < N_FEATURES; f++) {
+            circular_buffer[buffer_count][f] = nuevo_vector[f];
+        }
+        buffer_timestamps[buffer_count] = etiqueta_tiempo;
         buffer_count++;
+        
         if (buffer_count >= SEQ_LENGTH) {
             buffer_lleno = true;
+            window_head = 0; // El índice 0 pasa a ser el dato más antiguo
         }
+    } else {
+        // Modo permanente: Sobrescribir solo la posición más antigua
+        for (int f = 0; f < N_FEATURES; f++) {
+            circular_buffer[window_head][f] = nuevo_vector[f];
+        }
+        buffer_timestamps[window_head] = etiqueta_tiempo;
+        
+        // Avanzar el puntero circularmente
+        window_head = (window_head + 1) % SEQ_LENGTH;
     }
 }
 
 float ejecutar_inferencia_y_calibrar() {
-    
-    // 1. Llenar el Tensor de Entrada (Flattening)
-    // TFLite espera un array plano (1D) de 144 posiciones (18 x 8).
-    int flat_index = 0;
-    for (int i = 0; i < SEQ_LENGTH; i++) {
-        for (int j = 0; j < N_FEATURES; j++) {
-            // Asumimos que 'input_tensor' es tu variable global de TFLite
-            input_tensor->data.f[flat_index] = circular_buffer[i][j];
-            flat_index++;
+    // 1. Llenar el Tensor de Entrada usando el Ring Buffer
+    float* inp = input_tensor->data.f;
+    for (int t = 0; t < SEQ_LENGTH; t++) {
+        // Desenvolvemos la matriz empezando desde el puntero más antiguo
+        int idx = (window_head + t) % SEQ_LENGTH;
+        for (int f = 0; f < N_FEATURES; f++) {
+            inp[t * N_FEATURES + f] = circular_buffer[idx][f];
         }
     }
 
     // 2. Ejecutar la Red Neuronal (LSTM)
     unsigned long t_inicio = micros();
-    
-    TfLiteStatus invoke_status = interpreter->Invoke(); // ¡La magia ocurre aquí!
-    
-    if (invoke_status != kTfLiteOk) {
+    if (interpreter->Invoke() != kTfLiteOk) {
         Serial.println("[ERROR CRÍTICO] Fallo al invocar el intérprete TFLite");
         return -1.0f; 
     }
     unsigned long t_fin = micros();
     unsigned long latencia = t_fin - t_inicio;
 
-    // 3. Extraer la predicción normalizada [0, 1]
+    // 3. Extraer y desescalar
     float pred_norm = output_tensor->data.f[0];
-    pred_norm = max(pred_norm, 0.0f); // Evitar minúsculos rebotes negativos por la noche
-
-    // 4. Desescalar a Vatios (usando tu scaler_params.h)
+    pred_norm = max(pred_norm, 0.0f); // Evitar potencias negativas
     float pred_W_bruta = denormalize_output(pred_norm);
 
-    // 5. Aplicar la Calibración Física (Factor de Reducción K)
-    // Pon el valor exacto que sacaste con tu script de Python
+    // 4. Calibración K
     const float FACTOR_K = 0.2854f; 
     float pred_W_final = pred_W_bruta * FACTOR_K;
 
@@ -436,23 +422,37 @@ void debug_imprimir_buffer_completo() {
                   buffer_count, SEQ_LENGTH, buffer_lleno ? "[LISTO PARA IA]" : "[LLENANDO]");
     Serial.println("=====================================================================");
     
-    for (int i = 0; i < SEQ_LENGTH; i++) {
-        // Si la fila está vacía, ponemos --:--
-        String ts = buffer_timestamps[i];
+    // Iteramos 't' como tiempo cronológico, no como índice de memoria
+    for (int t = 0; t < SEQ_LENGTH; t++) {
+        
+        // Evitamos imprimir filas vacías si el buffer aún se está cebando
+        if (!buffer_lleno && t >= buffer_count) break;
+
+        // 1. CÁLCULO DEL ÍNDICE FÍSICO
+        // Si está lleno, leemos desde window_head. Si no, leemos normal.
+        int idx = buffer_lleno ? ((window_head + t) % SEQ_LENGTH) : t;
+        
+        String ts = buffer_timestamps[idx];
         if (ts.length() == 0) ts = "--:--";
 
-        // Formato alineado de las etiquetas
-        if (i == 0) {
-            Serial.printf(" [t-17] (%s) (Antiguo) -> [", ts.c_str());
-        } else if (i == SEQ_LENGTH - 1) {
+        // 2. ETIQUETAS TEMPORALES CORREGIDAS
+        // Calculamos los saltos hacia atrás desde la muestra más reciente
+        int offset = buffer_lleno ? (SEQ_LENGTH - 1 - t) : (buffer_count - 1 - t);
+
+        if (offset == 0) {
+            // Es la muestra más reciente (offset = 0)
             Serial.printf(" [ t  ] (%s) (Actual)  -> [", ts.c_str());
+        } else if (t == 0) {
+            // Es la muestra más antigua registrada hasta ahora
+            Serial.printf(" [t-%02d] (%s) (Antiguo) -> [", offset, ts.c_str());
         } else {
-            Serial.printf(" [t-%02d] (%s)           -> [", SEQ_LENGTH - 1 - i, ts.c_str());
+            // Muestras intermedias
+            Serial.printf(" [t-%02d] (%s)           -> [", offset, ts.c_str());
         }
 
-        // Imprimir el vector normalizado
+        // 3. IMPRESIÓN DE LA MATRIZ
         for (int j = 0; j < N_FEATURES; j++) {
-            Serial.printf("%5.3f", circular_buffer[i][j]); 
+            Serial.printf("%5.3f", circular_buffer[idx][j]); 
             if (j < N_FEATURES - 1) Serial.print(", ");
         }
         Serial.println("]");
@@ -765,7 +765,7 @@ void SDsetup() {
     File file = SD.open(logFile, FILE_WRITE);
     if (file) {
       // Cabeceras exactas solicitadas
-      file.println("Timestamp,Irradiancia_G,Tc,T_Amb,Hum_Rel,V_PV2,I_PV2,P_DC_W,P_AC_W,E_Daily_kWh,E_Total_kWh,Precio_EUR_kWh");
+      file.println("Timestamp,Irradiancia_G,Tc,T_Amb,Hum_Rel,V_PV2,I_PV2,P_DC_W,P_AC_W,E_Daily_kWh,E_Total_kWh,Precio_EUR_kWh,Prediccion_IA_W");
       file.close();
       Serial.println("[SD] Archivo CSV creado con cabeceras.");
     } else {
@@ -776,7 +776,7 @@ void SDsetup() {
   }
 }
 
-void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
+void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia) {
   File file = SD.open(logFile, FILE_APPEND);
   if (file) {
     file.print(getTimeStamp()); file.print(",");
@@ -790,9 +790,10 @@ void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, con
     file.print(inv.p_ac_out, 2); file.print(",");
     file.print(inv.e_daily, 2); file.print(",");
     file.print(inv.e_total, 2); file.print(",");
-    file.println(precioActualKWh, 4); // 4 decimales de precisión para los euros + salto línea
+    file.print(precioActualKWh, 4); file.print(",");
+    file.println(prediccion_ia, 2); // 2 decimales de precisión para la predicción
     file.close();
-    Serial.println(">>> Registro guardado en SD (11 variables incl. Precio).");
+    Serial.println(">>> Registro guardado en SD (12 variables incl. IA).");
   } else {
     Serial.println("[ERROR] Error abriendo el archivo SD para guardar.");
   }
