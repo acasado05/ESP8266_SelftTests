@@ -10,6 +10,7 @@
 #include <time.h>
 #include <SPI.h>
 #include <SD.h>
+#include <PubSubClient.h>
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -57,6 +58,7 @@ int window_head = 0;
 const char* ssid = "TP-LINK_C062";
 const char* password = "77817570";
 const char* esiosToken = "76f5317763cf71beec91ede16a667d8428e1ff3b793d45665a3c803e5ea5e68e";
+const char* mqtt_server = "10.0.10.20";
 
 // --- Configuración NTP y Zona Horaria (Madrid) ---
 const char* MY_TZ = "CET-1CEST,M3.5.0,M10.5.0/3"; 
@@ -69,7 +71,12 @@ float precioActualKWh = 0.0;
 
 // --- Temporizadores no bloqueantes ---
 unsigned long lastSerialTime = 0;
-const unsigned long serialInterval = 600000; // 10 segundos
+const unsigned long serialInterval = 30000; // 30 segundos
+
+// --- Temporizadores MQTT ---
+unsigned long lastSerialMQTTTime = 0;
+const unsigned long serialMQTTInterval = 30000;
+unsigned long lastMQTTReconnectAttempt = 0;
 
 // Sensores
 Adafruit_ADS1115 ads;
@@ -79,6 +86,10 @@ Adafruit_BMP280 bmp;
 // Variables microSD
 SPIClass spiSD(FSPI);
 const char* logFile = "/datalogger_tfg.csv";
+
+// Variables MQTT
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
 
 struct MedidasAmbientales {
   float tempAHT;
@@ -153,6 +164,7 @@ DatosInversor leerInversorHuawei();
 void SDsetup();
 void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia);
 void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
+void reconnectMQTT();
 
 // Funciones auxiliares Modbus
 uint16_t crc16(const uint8_t *data, uint8_t len);
@@ -176,6 +188,8 @@ void setup() {
   Serial2.begin(RS485_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
 
   wifiSetUp();
+  mqttClient.setServer(mqtt_server, 1883);
+  mqttClient.setBufferSize(512);
 
   // Configuración de MicroSD
   SDsetup();
@@ -219,6 +233,15 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
+  // 1. GESTIÓN MQTT (Mantener conexión viva sin bloquear)
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected() && (currentMillis - lastMQTTReconnectAttempt > 5000)) {
+        lastMQTTReconnectAttempt = currentMillis;
+        reconnectMQTT();
+    }
+    mqttClient.loop();
+  }
+
   // 1. ESIOS (se actualiza de fondo cada 10 minutos)
   if (currentMillis - lastTimeRequest >= timerDelay) {
       lastTimeRequest = currentMillis;
@@ -231,58 +254,90 @@ void loop() {
   if (currentMillis - lastSerialTime >= serialInterval) {
     lastSerialTime = currentMillis;
 
-    // Obtener medidas físicas en este instante preciso
-    MedidasAmbientales misMedidasAmb = realizarMedida();
-    DatosFotovoltaicos misDatosFV = calcularParametrosSolares(misMedidasAmb.tempAmbFinal);
-    DatosInversor misDatosInv = leerInversorHuawei();
+    // 3. ADQUISICIÓN, SERIAL Y PUBLICACIÓN MQTT (Cada 30 segundos)
+    static bool primerCiclo = true;
+    if (currentMillis - lastSerialMQTTTime >= serialMQTTInterval || primerCiclo) {
+      lastSerialMQTTTime = currentMillis;
 
-    // Imprimir por Monitor Serie
-    logDatosSerial(misMedidasAmb, misDatosFV, misDatosInv);
+      // Obtener medidas físicas
+      MedidasAmbientales misMedidasAmb = realizarMedida();
+      DatosFotovoltaicos misDatosFV = calcularParametrosSolares(misMedidasAmb.tempAmbFinal);
+      DatosInversor misDatosInv = leerInversorHuawei();
 
-    // Extraemos el mes (1-12) y la hora (0-23) del struct timeinfo (NTP)
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        Serial.println("[IA WARNING] Fallo NTP. Usando hora por defecto.");
-        timeinfo.tm_mon = 4;
-        timeinfo.tm_hour = 12;
-    }
-    int mes_actual = timeinfo.tm_mon + 1; 
-    int hora_actual = timeinfo.tm_hour;
+      // Imprimir por Monitor Serie
+      logDatosSerial(misMedidasAmb, misDatosFV, misDatosInv);
 
-    // 2. PROTECCIONES DE SENSORES
-    float g_seguro   = isnan(misDatosFV.G) ? 0.0f : misDatosFV.G;
-    float ta_seguro  = isnan(misMedidasAmb.tempAHT) ? 25.0f : misMedidasAmb.tempAHT;
-    float hum_seguro = isnan(misMedidasAmb.humAHT) ? 50.0f : misMedidasAmb.humAHT;
-    float tc_seguro  = isnan(misDatosFV.Tc_NOCT) ? ta_seguro : misDatosFV.Tc_NOCT; 
+      // Empaquetar y enviar por MQTT
+      if (mqttClient.connected()) {
+        JsonDocument doc;
+        doc["timestamp"] = getTimeStamp();
+        doc["g_w_m2"] = misDatosFV.G;
+        doc["tc_noct_c"] = misDatosFV.Tc_NOCT;
+        doc["t_amb_c"] = misMedidasAmb.tempAmbFinal;
+        doc["humedad_rel"] = misMedidasAmb.humAHT;
+        doc["v_pv2"] = misDatosInv.v_pv2;
+        doc["i_pv2"] = misDatosInv.i_pv2;
+        doc["p_dc_in_w"] = misDatosInv.p_dc_in;
+        doc["p_ac_out_w"] = misDatosInv.p_ac_out;
+        doc["e_daily_kwh"] = misDatosInv.e_daily;
+        doc["e_total_kwh"] = misDatosInv.e_total;
+        doc["precio_eur_kwh"] = precioActualKWh;
 
-    // 3. PIPELINE IA
-    float vector_ia_actual[N_FEATURES];
-    procesar_y_normalizar(mes_actual, hora_actual, g_seguro, ta_seguro, hum_seguro, tc_seguro, vector_ia_actual);
+        char jsonBuffer[512];
+        serializeJson(doc, jsonBuffer);
+        
+        if (mqttClient.publish("tfg/ia_fv/datos", jsonBuffer)) {
+            Serial.println("[MQTT] Datos publicados con éxito.");
+        } else {
+            Serial.println("[MQTT] Fallo al publicar datos.");
+        }
+      }
+
+    // // Extraemos el mes (1-12) y la hora (0-23) del struct timeinfo (NTP)
+    // struct tm timeinfo;
+    // if (!getLocalTime(&timeinfo)) {
+    //     Serial.println("[IA WARNING] Fallo NTP. Usando hora por defecto.");
+    //     timeinfo.tm_mon = 4;
+    //     timeinfo.tm_hour = 12;
+    // }
+    // int mes_actual = timeinfo.tm_mon + 1; 
+    // int hora_actual = timeinfo.tm_hour;
+
+    // // 2. PROTECCIONES DE SENSORES
+    // float g_seguro   = isnan(misDatosFV.G) ? 0.0f : misDatosFV.G;
+    // float ta_seguro  = isnan(misMedidasAmb.tempAHT) ? 25.0f : misMedidasAmb.tempAHT;
+    // float hum_seguro = isnan(misMedidasAmb.humAHT) ? 50.0f : misMedidasAmb.humAHT;
+    // float tc_seguro  = isnan(misDatosFV.Tc_NOCT) ? ta_seguro : misDatosFV.Tc_NOCT; 
+
+    // // 3. PIPELINE IA
+    // float vector_ia_actual[N_FEATURES];
+    // procesar_y_normalizar(mes_actual, hora_actual, g_seguro, ta_seguro, hum_seguro, tc_seguro, vector_ia_actual);
     
-    // 4. ¡EL TOQUE MAESTRO! Obtenemos la etiqueta usando tu función
-    String etiqueta_actual = getTimeStamp(); 
+    // // 4. ¡EL TOQUE MAESTRO! Obtenemos la etiqueta usando tu función
+    // String etiqueta_actual = getTimeStamp(); 
     
-    // Y se la pasamos al buffer para que la guarde junto con los datos
-    actualizar_buffer_circular(vector_ia_actual, etiqueta_actual);
+    // // Y se la pasamos al buffer para que la guarde junto con los datos
+    // actualizar_buffer_circular(vector_ia_actual, etiqueta_actual);
 
-    // 5. Imprimir Matriz Completa
-    debug_imprimir_buffer_completo();
+    // // 5. Imprimir Matriz Completa
+    // debug_imprimir_buffer_completo();
 
-    // 6. INFERENCIA Y GUARDADO SINCRONIZADO EN SD
-    // Inicializamos a 0 por si el buffer aún no está lleno
-    float prediccion_W = 0.0f; 
+    // // 6. INFERENCIA Y GUARDADO SINCRONIZADO EN SD
+    // // Inicializamos a 0 por si el buffer aún no está lleno
+    // float prediccion_W = 0.0f; 
 
-    if (buffer_lleno) {
-        // Ejecutamos el modelo y guardamos el resultado en la variable
-        prediccion_W = ejecutar_inferencia_y_calibrar();
-    } else {
-        Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
+    // if (buffer_lleno) {
+    //     // Ejecutamos el modelo y guardamos el resultado en la variable
+    //     prediccion_W = ejecutar_inferencia_y_calibrar();
+    // } else {
+    //     Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
+    // }
+
+    // // Guardar ABSOLUTAMENTE TODO en la tarjeta SD de una sola vez
+    // // (Si el buffer se está llenando, guardará 0.0 W en la columna de IA)
+    // saveDataSD(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
     }
-
-    // Guardar ABSOLUTAMENTE TODO en la tarjeta SD de una sola vez
-    // (Si el buffer se está llenando, guardará 0.0 W en la columna de IA)
-    saveDataSD(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
-
+    primerCiclo = false;
   } // Fin del bloque principal
 }
 
@@ -458,6 +513,20 @@ void debug_imprimir_buffer_completo() {
         Serial.println("]");
     }
     Serial.println("=====================================================================\n");
+}
+
+void reconnectMQTT() {
+  Serial.print("[MQTT] Intentando conectar al broker... ");
+  String clientId = "ESP32S3-Monitor-";
+  clientId += String(random(0, 1000), HEX);
+  
+  if (mqttClient.connect(clientId.c_str())) {
+    Serial.println("¡Conectado!");
+  } else {
+    Serial.print("Fallo, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" -> Reintentando en breve.");
+  }
 }
 
 DatosInversor leerInversorHuawei() {
