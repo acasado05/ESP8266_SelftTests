@@ -270,18 +270,17 @@ void loop() {
       // Empaquetar y enviar por MQTT
       if (mqttClient.connected()) {
         JsonDocument doc;
-        doc["timestamp"] = getTimeStamp();
         doc["g_w_m2"] = misDatosFV.G;
         doc["tc_noct_c"] = misDatosFV.Tc_NOCT;
         doc["t_amb_c"] = misMedidasAmb.tempAmbFinal;
-        doc["humedad_rel"] = misMedidasAmb.humAHT;
+        doc["hum_rel"] = misMedidasAmb.humAHT;
         doc["v_pv2"] = misDatosInv.v_pv2;
         doc["i_pv2"] = misDatosInv.i_pv2;
         doc["p_dc_in_w"] = misDatosInv.p_dc_in;
         doc["p_ac_out_w"] = misDatosInv.p_ac_out;
+        doc["precio_kwh"] = precioActualKWh;
         doc["e_daily_kwh"] = misDatosInv.e_daily;
-        doc["e_total_kwh"] = misDatosInv.e_total;
-        doc["precio_eur_kwh"] = precioActualKWh;
+        //Añadir prediccion cuando toque!
 
         char jsonBuffer[512];
         serializeJson(doc, jsonBuffer);
@@ -869,6 +868,42 @@ void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, con
 }
 
 void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
+    Serial.println("\n=============================================");
+    Serial.print(" TIMESTAMP: "); 
+    Serial.println(getTimeStamp());
+    Serial.println("=============================================");
+    
+    Serial.println("[Datos Ambientales]");
+    Serial.print("Temp BMP280              : "); Serial.print(amb.tempBMP, 2); Serial.println(" °C"); 
+    Serial.print("Temp AHT20               : "); Serial.print(amb.tempAHT, 2); Serial.println(" °C");
+    Serial.print("Temp Ambiente (Promedio) : "); Serial.print(amb.tempAmbFinal, 2); Serial.println(" °C");
+    Serial.print("Humedad Relativa (AHT20) : "); Serial.print(amb.humAHT, 2); Serial.println(" %");
+    
+    Serial.println("\n[Comparativa V_Shunt]");
+    Serial.print("ESP32-S3 (ADC Interno)   : "); Serial.print(fv.V_shunt_ESP32, 4); Serial.println(" V");
+    Serial.print("ADS1115 (ADC Externo)    : "); Serial.print(fv.V_shunt_ADS, 4); Serial.println(" V");
+    
+    Serial.println("\n[Cálculos Célula Calibrada (Basados en ADS)]");
+    Serial.print("Corriente Isc            : "); Serial.print(fv.Isc, 3); Serial.println(" A");
+    Serial.print("Irradiancia (G)          : "); Serial.print(fv.G, 2); Serial.println(" W/m2");
+    Serial.print("Temp Célula (Tc_NOCT)    : "); Serial.print(fv.Tc_NOCT, 2); Serial.println(" °C");
+
+    Serial.println("\n[Inversor Huawei SUN2000]");
+    Serial.printf("Tensión PV2              : %7.2f V\n", inv.v_pv2);
+    Serial.printf("Corriente PV2            : %7.2f A\n", inv.i_pv2);
+    Serial.printf("Potencia DC (Entrada)    : %7.2f W\n", inv.p_dc_in);
+    Serial.printf("Potencia AC (Salida)     : %7.2f W\n", inv.p_ac_out);
+    if (inv.p_dc_in > 0) {
+      float eff = ((float)inv.p_ac_out / (float)inv.p_dc_in) * 100.0f;
+      Serial.printf("Eficiencia Instantánea   : %7.1f %%\n", eff);
+    }
+
+    Serial.println("\n[Mercado Eléctrico]");
+    Serial.print("Precio PVPC Actual       : "); Serial.print(precioActualKWh, 4); Serial.println(" EUR/kWh");
+    Serial.println("---------------------------------------------");
+}
+
+void logDatosSerial_N(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
     Serial.println("\n=============================================");
     Serial.print(" TIMESTAMP: "); 
     Serial.println(getTimeStamp());
