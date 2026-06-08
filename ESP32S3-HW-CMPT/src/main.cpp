@@ -263,6 +263,11 @@ void loop() {
     DatosFotovoltaicos misDatosFV = calcularParametrosSolares(misMedidasAmb.tempAmbFinal);
     DatosInversor misDatosInv = leerInversorHuawei();
 
+    if(misDatosFV.G < 40.0f || misDatosInv.v_pv2 < 50.0f){
+      misDatosFV.G = 0.0f;
+      misDatosFV.Tc_NOCT = misMedidasAmb.tempAmbFinal; //En caso de que no haya Sol
+    }
+
     float prediccion_W = 0.0f; 
 
     // Imprimir por Monitor Serie
@@ -298,6 +303,12 @@ void loop() {
       if (buffer_lleno) {
         // Ejecutamos el modelo y guardamos el resultado en la variable
         prediccion_W = ejecutar_inferencia_y_calibrar();
+
+        // Si el inversor no detecta tensión suficiente para arrancar (< 50 V) o su potencia de entrada es nula
+        // forzamos la prediccion a 0 W. 
+        if(misDatosInv.v_pv2 < 50.0f || misDatosInv.p_dc_in <= 0.0f){
+          prediccion_W = 0.0f;
+        }
       } else {
         Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
       }
@@ -311,7 +322,7 @@ void loop() {
         
       if (mqttClient.connected()) {
         JsonDocument doc;
-        doc["Irradiancia"] = misDatosFV.G;
+        doc["irradiancia"] = misDatosFV.G;
         doc["tc_noct_c"]   = misDatosFV.Tc_NOCT;
         doc["t_amb_c"]     = misMedidasAmb.tempAmbFinal;
         doc["hum_rel"]     = misMedidasAmb.humAHT;
@@ -458,7 +469,7 @@ float ejecutar_inferencia_y_calibrar() {
     float pred_W_bruta = denormalize_output(pred_norm);
 
     // 4. Calibración K
-    const float FACTOR_K = 0.2854f; 
+    const float FACTOR_K = 0.1775f; 
     float pred_W_final = pred_W_bruta * FACTOR_K;
 
     // Imprimir resultados
