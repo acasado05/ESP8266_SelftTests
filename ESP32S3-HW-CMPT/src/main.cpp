@@ -19,6 +19,7 @@
 #include <scaler_params.h>
 #include "LSTM_model.h"
 
+#define G_UMBRAL 20.0f // Umbral de irradiancia para filtrado de valores espurios
 #define DEBUG_MODE false // true para ver tramas crudas Modbus
 
 // --- Configuración hardware RS-485 (Inversor) ---
@@ -34,8 +35,8 @@
 #define REG_PV2_CURRENT   32019   // I16, Gain 100 (A)
 #define REG_P_INPUT_DC    32064   // I32, Gain 1 (W)
 #define REG_P_ACTIVE_AC   32080   // I32, Gain 1 (W)
-#define REG_E_DAILY       32214   // U32, Gain 100 (kWh) - Energía Diaria
-#define REG_E_TOTAL       32216   // U32, Gain 100 (kWh) - Energía Total
+#define REG_E_TOTAL       32106   // U32, Gain 100 (kWh) - Energía Total
+#define REG_E_DAILY       32114   // U32, Gain 100 (kWh) - Energía Diaria
 
 // --- Configuración MicroSD ---
 #define SD_SCK  12
@@ -70,12 +71,15 @@ const unsigned long timerDelay = 600000;
 float precioActualKWh = 0.0;
 
 // --- Temporizadores no bloqueantes ---
-unsigned long lastSerialTime = 0;
-const unsigned long serialInterval = 30000; // 30 segundos
+unsigned long lastSerialTime     = 0;
+unsigned long lastMQTTTime = 0;
+unsigned long lastAITime         = 0;
 
-// --- Temporizadores MQTT ---
-unsigned long lastSerialMQTTTime = 0;
-const unsigned long serialMQTTInterval = 30000;
+const unsigned long serialInterval     = 30000;  // 30 segundos: serial log
+const unsigned long mqttInterval = 60000;  // 60 segundos: envío MQTT
+const unsigned long aiSDInterval       = 600000; // 10 minutos (IA + microSD)
+
+// Temporizador reconexión MQTT
 unsigned long lastMQTTReconnectAttempt = 0;
 
 // Sensores
@@ -163,8 +167,9 @@ DatosFotovoltaicos calcularParametrosSolares(float ambTemp);
 DatosInversor leerInversorHuawei();
 void SDsetup();
 void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia);
-void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
+void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia);
 void reconnectMQTT();
+void logDatosSerial_Ant(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
 
 // Funciones auxiliares Modbus
 uint16_t crc16(const uint8_t *data, uint8_t len);
@@ -231,6 +236,7 @@ void setup() {
 }
 
 void loop() {
+  
   unsigned long currentMillis = millis();
 
   // 1. GESTIÓN MQTT (Mantener conexión viva sin bloquear)
@@ -242,102 +248,97 @@ void loop() {
     mqttClient.loop();
   }
 
-  // 1. ESIOS (se actualiza de fondo cada 10 minutos)
+  // 2. ESIOS (se actualiza de fondo cada 10 minutos)
   if (currentMillis - lastTimeRequest >= timerDelay) {
       lastTimeRequest = currentMillis;
       obtenerPrecioESIOS();
   }
 
-  // 2. Bloque principal unificado: Adquisición, IA y Guardado SD
-  // IMPORTANTE: Recuerda cambiar arriba en tus variables globales:
-  // const unsigned long serialInterval = 600000; // Para que dispare cada 10 minutos
+  // 3. Bloque principal unificado: Adquisición, IA y Guardado SD
   if (currentMillis - lastSerialTime >= serialInterval) {
     lastSerialTime = currentMillis;
 
-    // 3. ADQUISICIÓN, SERIAL Y PUBLICACIÓN MQTT (Cada 30 segundos)
-    static bool primerCiclo = true;
-    if (currentMillis - lastSerialMQTTTime >= serialMQTTInterval || primerCiclo) {
-      lastSerialMQTTTime = currentMillis;
+    // Obtener medidas físicas
+    MedidasAmbientales misMedidasAmb = realizarMedida();
+    DatosFotovoltaicos misDatosFV = calcularParametrosSolares(misMedidasAmb.tempAmbFinal);
+    DatosInversor misDatosInv = leerInversorHuawei();
 
-      // Obtener medidas físicas
-      MedidasAmbientales misMedidasAmb = realizarMedida();
-      DatosFotovoltaicos misDatosFV = calcularParametrosSolares(misMedidasAmb.tempAmbFinal);
-      DatosInversor misDatosInv = leerInversorHuawei();
+    float prediccion_W = 0.0f; 
 
-      // Imprimir por Monitor Serie
-      logDatosSerial(misMedidasAmb, misDatosFV, misDatosInv);
+    // Imprimir por Monitor Serie
+    logDatosSerial(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
 
-      // Empaquetar y enviar por MQTT
+    // 3. IA + MICROSD
+    if (currentMillis - lastAITime >= aiSDInterval) {
+      lastAITime = currentMillis;
+
+      struct tm timeinfo;
+      if (!getLocalTime(&timeinfo)) {
+          Serial.println("[IA WARNING] Fallo NTP. Usando hora por defecto.");
+          timeinfo.tm_mon = 4;
+          timeinfo.tm_hour = 12;
+      }
+      int mes_actual = timeinfo.tm_mon + 1; 
+      int hora_actual = timeinfo.tm_hour;
+
+      // 2. PROTECCIONES DE SENSORES
+      float g_seguro   = isnan(misDatosFV.G) ? 0.0f : misDatosFV.G;
+      float ta_seguro  = isnan(misMedidasAmb.tempAHT) ? 25.0f : misMedidasAmb.tempAHT;
+      float hum_seguro = isnan(misMedidasAmb.humAHT) ? 50.0f : misMedidasAmb.humAHT;
+      float tc_seguro  = isnan(misDatosFV.Tc_NOCT) ? ta_seguro : misDatosFV.Tc_NOCT; 
+
+      // 3. PIPELINE IA
+      float vector_ia_actual[N_FEATURES];
+      procesar_y_normalizar(mes_actual, hora_actual, g_seguro, ta_seguro, hum_seguro, tc_seguro, vector_ia_actual);
+
+      String etiqueta_actual = getTimeStamp(); 
+      actualizar_buffer_circular(vector_ia_actual, etiqueta_actual);
+      debug_imprimir_buffer_completo();
+
+      if (buffer_lleno) {
+        // Ejecutamos el modelo y guardamos el resultado en la variable
+        prediccion_W = ejecutar_inferencia_y_calibrar();
+      } else {
+        Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
+      }
+
+      saveDataSD(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
+    }
+
+    //4. Envío MQTT cada minuto
+    if (currentMillis - lastMQTTTime >= mqttInterval) {
+      lastMQTTTime = currentMillis; 
+        
       if (mqttClient.connected()) {
         JsonDocument doc;
-        doc["g_w_m2"] = misDatosFV.G;
-        doc["tc_noct_c"] = misDatosFV.Tc_NOCT;
-        doc["t_amb_c"] = misMedidasAmb.tempAmbFinal;
-        doc["hum_rel"] = misMedidasAmb.humAHT;
-        doc["v_pv2"] = misDatosInv.v_pv2;
-        doc["i_pv2"] = misDatosInv.i_pv2;
-        doc["p_dc_in_w"] = misDatosInv.p_dc_in;
-        doc["p_ac_out_w"] = misDatosInv.p_ac_out;
-        doc["precio_kwh"] = precioActualKWh;
+        doc["Irradiancia"] = misDatosFV.G;
+        doc["tc_noct_c"]   = misDatosFV.Tc_NOCT;
+        doc["t_amb_c"]     = misMedidasAmb.tempAmbFinal;
+        doc["hum_rel"]     = misMedidasAmb.humAHT;
+        doc["v_pv2"]       = misDatosInv.v_pv2;
+        doc["i_pv2"]       = misDatosInv.i_pv2;
+        doc["p_dc_in_w"]   = misDatosInv.p_dc_in;
+        doc["p_ac_out_w"]  = misDatosInv.p_ac_out;
+        doc["precio_kwh"]  = precioActualKWh;
         doc["e_daily_kwh"] = misDatosInv.e_daily;
-        //Añadir prediccion cuando toque!
+        doc["prediccion"]  = prediccion_W;
 
         char jsonBuffer[512];
         serializeJson(doc, jsonBuffer);
         
         if (mqttClient.publish("tfg/ia_fv/datos", jsonBuffer)) {
-            Serial.println("[MQTT] Datos publicados con éxito.");
-        } else {
-            Serial.println("[MQTT] Fallo al publicar datos.");
+          Serial.println("║ [MQTT] Datos telemétricos publicados con éxito en el broker  ║");
+          Serial.println("╚══════════════════════════════════════════════════════════════╝\n");
+        }else{
+          Serial.println("║ [MQTT] Error al publicar datos en el broker. Intentando reconectar... ║");
+          Serial.println("╚══════════════════════════════════════════════════════════════╝\n");
+          mqttClient.disconnect();
         }
       }
-
-    // // Extraemos el mes (1-12) y la hora (0-23) del struct timeinfo (NTP)
-    // struct tm timeinfo;
-    // if (!getLocalTime(&timeinfo)) {
-    //     Serial.println("[IA WARNING] Fallo NTP. Usando hora por defecto.");
-    //     timeinfo.tm_mon = 4;
-    //     timeinfo.tm_hour = 12;
-    // }
-    // int mes_actual = timeinfo.tm_mon + 1; 
-    // int hora_actual = timeinfo.tm_hour;
-
-    // // 2. PROTECCIONES DE SENSORES
-    // float g_seguro   = isnan(misDatosFV.G) ? 0.0f : misDatosFV.G;
-    // float ta_seguro  = isnan(misMedidasAmb.tempAHT) ? 25.0f : misMedidasAmb.tempAHT;
-    // float hum_seguro = isnan(misMedidasAmb.humAHT) ? 50.0f : misMedidasAmb.humAHT;
-    // float tc_seguro  = isnan(misDatosFV.Tc_NOCT) ? ta_seguro : misDatosFV.Tc_NOCT; 
-
-    // // 3. PIPELINE IA
-    // float vector_ia_actual[N_FEATURES];
-    // procesar_y_normalizar(mes_actual, hora_actual, g_seguro, ta_seguro, hum_seguro, tc_seguro, vector_ia_actual);
-    
-    // // 4. ¡EL TOQUE MAESTRO! Obtenemos la etiqueta usando tu función
-    // String etiqueta_actual = getTimeStamp(); 
-    
-    // // Y se la pasamos al buffer para que la guarde junto con los datos
-    // actualizar_buffer_circular(vector_ia_actual, etiqueta_actual);
-
-    // // 5. Imprimir Matriz Completa
-    // debug_imprimir_buffer_completo();
-
-    // // 6. INFERENCIA Y GUARDADO SINCRONIZADO EN SD
-    // // Inicializamos a 0 por si el buffer aún no está lleno
-    // float prediccion_W = 0.0f; 
-
-    // if (buffer_lleno) {
-    //     // Ejecutamos el modelo y guardamos el resultado en la variable
-    //     prediccion_W = ejecutar_inferencia_y_calibrar();
-    // } else {
-    //     Serial.println("[INFO] Búfer llenándose. No se realiza inferencia todavía.");
-    // }
-
-    // // Guardar ABSOLUTAMENTE TODO en la tarjeta SD de una sola vez
-    // // (Si el buffer se está llenando, guardará 0.0 W en la columna de IA)
-    // saveDataSD(misMedidasAmb, misDatosFV, misDatosInv, prediccion_W);
     }
-    primerCiclo = false;
   } // Fin del bloque principal
+
+  
 }
 
 // --------------------------------------------------------
@@ -461,11 +462,11 @@ float ejecutar_inferencia_y_calibrar() {
     float pred_W_final = pred_W_bruta * FACTOR_K;
 
     // Imprimir resultados
-    Serial.println("\n[IA INFERENCIA] ==========================================");
-    Serial.printf(" Latencia de Inferencia : %lu us (%.2f ms)\n", latencia, latencia/1000.0);
-    Serial.printf(" Salida Red (Norm)      : %.4f\n", pred_norm);
-    Serial.printf(" Potencia Predicha      : %.1f W\n", pred_W_final);
-    Serial.println("==========================================================\n");
+    // Serial.println("\n[IA INFERENCIA] ==========================================");
+    // Serial.printf(" Latencia de Inferencia : %lu us (%.2f ms)\n", latencia, latencia/1000.0);
+    // Serial.printf(" Salida Red (Norm)      : %.4f\n", pred_norm);
+    // Serial.printf(" Potencia Predicha      : %.1f W\n", pred_W_final);
+    // Serial.println("==========================================================\n");
 
     return pred_W_final;
 }
@@ -529,40 +530,52 @@ void reconnectMQTT() {
 }
 
 DatosInversor leerInversorHuawei() {
-  DatosInversor inv = {0.0, 0.0, 0, 0};
+  DatosInversor inv = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   uint8_t res[64];
+  bool inversorResponde = false;
 
   // 1. Leer String 2 (Tensión y Corriente) - 2 registros
   sendModbusRequest(HUAWEI_ID, 0x03, REG_PV2_VOLTAGE, 2);
   if (readModbusResponse(res, sizeof(res)) >= 7) {
     inv.v_pv2 = (float)((uint16_t)res[3] << 8 | res[4]) / 10.0f;
     inv.i_pv2 = (float)((int16_t)res[5] << 8 | res[6]) / 100.0f;
+    inversorResponde = true;
   }
   delay(100);
 
-  // 2. Leer Potencia Entrada DC (I32)
-  sendModbusRequest(HUAWEI_ID, 0x03, REG_P_INPUT_DC, 2);
-  if (readModbusResponse(res, sizeof(res)) >= 9) {
-    int32_t raw_dc = (int32_t)res[3] << 24 | (int32_t)res[4] << 16 | (int32_t)res[5] << 8 | (int32_t)res[6];
-    inv.p_dc_in = (float)raw_dc;
-  }
-  delay(100);
+  if(inversorResponde){
 
-  // 3. Leer Potencia Salida AC (I32)
-  sendModbusRequest(HUAWEI_ID, 0x03, REG_P_ACTIVE_AC, 2);
-  if (readModbusResponse(res, sizeof(res)) >= 9) {
-    int32_t raw_ac = (int32_t)res[3] << 24 | (int32_t)res[4] << 16 | (int32_t)res[5] << 8 | (int32_t)res[6];
-    inv.p_ac_out = (float)raw_ac;
-  }
+    // 2. Leer Potencia Entrada DC (I32)
+    sendModbusRequest(HUAWEI_ID, 0x03, REG_P_INPUT_DC, 2);
+    if (readModbusResponse(res, sizeof(res)) >= 9) {
+      int32_t raw_dc = (int32_t)res[3] << 24 | (int32_t)res[4] << 16 | (int32_t)res[5] << 8 | (int32_t)res[6];
+      inv.p_dc_in = (float)raw_dc;
+    }
+    delay(100);
 
-  // 4. Leer Energía Diaria y Total (4 registros seguidos desde 32214)
-  sendModbusRequest(HUAWEI_ID, 0x03, REG_E_DAILY, 4);
-  if (readModbusResponse(res, sizeof(res)) >= 13) {
-    uint32_t raw_daily = (uint32_t)res[3] << 24 | (uint32_t)res[4] << 16 | (uint32_t)res[5] << 8 | (uint32_t)res[6];
-    uint32_t raw_total = (uint32_t)res[7] << 24 | (uint32_t)res[8] << 16 | (uint32_t)res[9] << 8 | (uint32_t)res[10];
-    
-    inv.e_daily = (float)raw_daily / 100.0f; // La ganancia en estos registros es de 100
-    inv.e_total = (float)raw_total / 100.0f;
+    // 3. Leer Potencia Salida AC (I32)
+    sendModbusRequest(HUAWEI_ID, 0x03, REG_P_ACTIVE_AC, 2);
+    if (readModbusResponse(res, sizeof(res)) >= 9) {
+      int32_t raw_ac = (int32_t)res[3] << 24 | (int32_t)res[4] << 16 | (int32_t)res[5] << 8 | (int32_t)res[6];
+      inv.p_ac_out = (float)raw_ac;
+    }
+
+    // 4. Leer Energía Diaria y Total (4 registros seguidos desde 32214)
+    sendModbusRequest(HUAWEI_ID, 0x03, REG_E_TOTAL, 2);
+      if (readModbusResponse(res, sizeof(res)) >= 9) {
+        uint32_t raw_total = (uint32_t)res[3] << 24 | (uint32_t)res[4] << 16 | (uint32_t)res[5] << 8 | (uint32_t)res[6];
+        inv.e_total = (float)raw_total / 100.0f;
+      }
+      delay(100);
+
+      // 5. Leer Energía Diaria (Registro 32114, tamaño 2 registros)
+      sendModbusRequest(HUAWEI_ID, 0x03, REG_E_DAILY, 2);
+      if (readModbusResponse(res, sizeof(res)) >= 9) {
+        uint32_t raw_daily = (uint32_t)res[3] << 24 | (uint32_t)res[4] << 16 | (uint32_t)res[5] << 8 | (uint32_t)res[6];
+        inv.e_daily = (float)raw_daily / 100.0f; 
+      }
+  }else{
+    Serial.println("║ [ALERTA] Inversor Huawei en Standby (Noche) / Sin respuesta Modbus ║");
   }
 
   return inv;
@@ -658,7 +671,13 @@ MedidasAmbientales realizarMedida (void){
   medidas.tempAHT = sumaTempAHT / MUESTRAS_PROMEDIO;
   medidas.humAHT = sumaHumAHT / MUESTRAS_PROMEDIO;
   medidas.tempBMP = sumaTempBMP / MUESTRAS_PROMEDIO;
-  medidas.tempAmbFinal = (medidas.tempAHT + medidas.tempBMP) / 2.0;
+  
+  // --- FILTRO DE ROBUSTEZ: Falla el BMP280 ---
+  if (isnan(medidas.tempBMP) || medidas.tempBMP < 0.0f || medidas.tempBMP > 80.0f) {
+      medidas.tempAmbFinal = medidas.tempAHT;
+  } else {
+      medidas.tempAmbFinal = (medidas.tempAHT + medidas.tempBMP) / 2.0f;
+  }
   
   return medidas;
 }
@@ -671,12 +690,9 @@ DatosFotovoltaicos calcularParametrosSolares(float ambTemp) {
     // 1. Toma de muestras promediada de la MISMA señal
     for (int i = 0; i < NUM_MUESTRAS_ADC; i++) {
         sum_esp32_mV += analogReadMilliVolts(internalAdcPin);
-        
         //int16_t results = ads.readADC_SingleEnded(0);
         int16_t results = ads.readADC_Differential_0_1();
-
         sum_ads_mV += ads.computeVolts(results) * 1000.0f;
-        
         delay(25); 
     }
 
@@ -687,11 +703,21 @@ DatosFotovoltaicos calcularParametrosSolares(float ambTemp) {
     datos.V_shunt_ESP32 = avg_esp32_mv / 1000.0f;
     datos.V_shunt_ADS   = avg_ads_mv / 1000.0f;
 
+    // --- CLAMPEO DE RUIDO NOCTURNO ---
+    // Forzamos a 0.0 cualquier lectura negativa del ADC para purificar Isc
+    datos.V_shunt_ADS = max(0.0f, datos.V_shunt_ADS);
+    datos.V_shunt_ESP32 = max(0.0f, datos.V_shunt_ESP32);
+
     // 3. Cálculos Fotovoltaicos (Usando el ADS1115 por su precisión)
     datos.Isc = datos.V_shunt_ADS / RSHUNT;
     
     // Irradiancia (aproximación directa sin realimentación térmica)
     datos.G = (datos.Isc * G_cem) / Isc_cal;
+
+    // --- FILTRO DE IRRADIANCIA: Corte por debajo de 40 W/m2 ---
+    if (datos.G < G_UMBRAL) {
+        datos.G = 0.0f;
+    }
     
     // Temperatura de la célula (Modelo NOCT simplificado que tenías)
     datos.Tc_NOCT = ambTemp + (NOCT * datos.G); 
@@ -867,7 +893,7 @@ void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, con
   }
 }
 
-void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
+void logDatosSerial_Ant(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
     Serial.println("\n=============================================");
     Serial.print(" TIMESTAMP: "); 
     Serial.println(getTimeStamp());
@@ -903,38 +929,37 @@ void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv,
     Serial.println("---------------------------------------------");
 }
 
-void logDatosSerial_N(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv) {
-    Serial.println("\n=============================================");
-    Serial.print(" TIMESTAMP: "); 
-    Serial.println(getTimeStamp());
-    Serial.println("=============================================");
+void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia) {
+    Serial.println("\n╔══════════════════════════════════════════════════════════════╗");
+    Serial.printf ("║ TELEMETRÍA DEL SISTEMA | %-35s ║\n", getTimeStamp().c_str());
+    Serial.println("╠══════════════════════════════════════════════════════════════╣");
     
-    Serial.println("[Datos Ambientales]");
-    Serial.print("Temp BMP280              : "); Serial.print(amb.tempBMP, 2); Serial.println(" °C"); 
-    Serial.print("Temp AHT20               : "); Serial.print(amb.tempAHT, 2); Serial.println(" °C");
-    Serial.print("Temp Ambiente (Promedio) : "); Serial.print(amb.tempAmbFinal, 2); Serial.println(" °C");
-    Serial.print("Humedad Relativa (AHT20) : "); Serial.print(amb.humAHT, 2); Serial.println(" %");
+    Serial.println("║ [Parámetros Ambientales]                                     ║");
+    Serial.printf ("║   Temperatura Ambiente (Ta)  : %6.2f °C                      ║\n", amb.tempAmbFinal);
+    Serial.printf ("║   Humedad Relativa           : %6.2f %%                       ║\n", amb.humAHT);
     
-    Serial.println("\n[Comparativa V_Shunt]");
-    Serial.print("ESP32-S3 (ADC Interno)   : "); Serial.print(fv.V_shunt_ESP32, 4); Serial.println(" V");
-    Serial.print("ADS1115 (ADC Externo)    : "); Serial.print(fv.V_shunt_ADS, 4); Serial.println(" V");
+    Serial.println("╠..............................................................╣");
+    Serial.println("║ [Panel Fotovoltaico de Referencia]                           ║");
+    Serial.printf ("║   Tensión Diferencial Shunt  : %6.2f mV                      ║\n", fv.V_shunt_ADS * 1000.0f);
+    Serial.printf ("║   Corriente de Célula (Isc)  : %6.3f A                       ║\n", fv.Isc);
+    Serial.printf ("║   Irradiancia Global (G)     : %6.2f W/m2                    ║\n", fv.G);
+    Serial.printf ("║   Temp. de Célula (Tc_NOCT)  : %6.2f °C                      ║\n", fv.Tc_NOCT);
     
-    Serial.println("\n[Cálculos Célula Calibrada (Basados en ADS)]");
-    Serial.print("Corriente Isc            : "); Serial.print(fv.Isc, 3); Serial.println(" A");
-    Serial.print("Irradiancia (G)          : "); Serial.print(fv.G, 2); Serial.println(" W/m2");
-    Serial.print("Temp Célula (Tc_NOCT)    : "); Serial.print(fv.Tc_NOCT, 2); Serial.println(" °C");
-
-    Serial.println("\n[Inversor Huawei SUN2000]");
-    Serial.printf("Tensión PV2              : %7.2f V\n", inv.v_pv2);
-    Serial.printf("Corriente PV2            : %7.2f A\n", inv.i_pv2);
-    Serial.printf("Potencia DC (Entrada)    : %7.2f W\n", inv.p_dc_in);
-    Serial.printf("Potencia AC (Salida)     : %7.2f W\n", inv.p_ac_out);
-    if (inv.p_dc_in > 0) {
-      float eff = ((float)inv.p_ac_out / (float)inv.p_dc_in) * 100.0f;
-      Serial.printf("Eficiencia Instantánea   : %7.1f %%\n", eff);
-    }
-
-    Serial.println("\n[Mercado Eléctrico]");
-    Serial.print("Precio PVPC Actual       : "); Serial.print(precioActualKWh, 4); Serial.println(" EUR/kWh");
-    Serial.println("---------------------------------------------");
+    Serial.println("╠..............................................................╣");
+    Serial.println("║ [Monitorización del Inversor y Mercado]                      ║");
+    Serial.printf ("║   Tensión String (PV2)       : %6.2f V                       ║\n", inv.v_pv2);
+    Serial.printf ("║   Corriente String (PV2)     : %6.2f A                       ║\n", inv.i_pv2);
+    Serial.printf ("║   Potencia Entrada (DC)      : %6.2f W                       ║\n", inv.p_dc_in);
+    Serial.printf ("║   Potencia Salida (AC)       : %6.2f W                       ║\n", inv.p_ac_out);
+    
+    // Calculamos eficiencia solo si hay potencia, para evitar divisiones por cero
+    float eff = (inv.p_dc_in > 0) ? ((float)inv.p_ac_out / (float)inv.p_dc_in) * 100.0f : 0.0f;
+    Serial.printf ("║   Eficiencia de Conversión   : %6.1f %%                      ║\n", eff);
+    Serial.printf ("║   Energía Diaria Acumulada   : %6.2f kWh                     ║\n", inv.e_daily);
+    Serial.printf ("║   Precio Energía (ESIOS)     : %6.4f EUR/kWh                 ║\n", precioActualKWh);
+    
+    Serial.println("╠══════════════════════════════════════════════════════════════╣");
+    Serial.println("║ [Predicción Inteligencia Artificial (Edge AI)]               ║");
+    Serial.printf ("║   Estimación Potencia LSTM   : %6.2f W                       ║\n", prediccion_ia);
+    Serial.println("╚══════════════════════════════════════════════════════════════╝\n");
 }

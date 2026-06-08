@@ -1,6 +1,6 @@
 // Modelo LSTM FULL INT8 para ESP32-S3 (Requisito TFG)
-// Generado autom�ticamente � NO EDITAR
-// Tama�o: 88.6 KB
+// Generado automáticamente — NO EDITAR
+// Tamaño: 88.6 KB
 
 #pragma once
 #include <stdint.h>
