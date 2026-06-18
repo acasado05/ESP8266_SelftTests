@@ -170,6 +170,7 @@ void saveDataSD(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, con
 void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv, float prediccion_ia);
 void reconnectMQTT();
 void logDatosSerial_Ant(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv, const DatosInversor& inv);
+String getHoraPrediccion();
 
 // Funciones auxiliares Modbus
 uint16_t crc16(const uint8_t *data, uint8_t len);
@@ -947,7 +948,7 @@ void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv,
     
     Serial.println("║ [Parámetros Ambientales]                                     ║");
     Serial.printf ("║   Temperatura Ambiente (Ta)  : %6.2f °C                      ║\n", amb.tempAmbFinal);
-    Serial.printf ("║   Humedad Relativa           : %6.2f %%                       ║\n", amb.humAHT);
+    Serial.printf ("║   Humedad Relativa           : %6.2f %%                      ║\n", amb.humAHT);
     
     Serial.println("╠..............................................................╣");
     Serial.println("║ [Panel Fotovoltaico de Referencia]                           ║");
@@ -971,6 +972,20 @@ void logDatosSerial(const MedidasAmbientales& amb, const DatosFotovoltaicos& fv,
     
     Serial.println("╠══════════════════════════════════════════════════════════════╣");
     Serial.println("║ [Predicción Inteligencia Artificial (Edge AI)]               ║");
-    Serial.printf ("║   Estimación Potencia LSTM   : %6.2f W                       ║\n", prediccion_ia);
+    Serial.printf ("║   Predicción LSTM (%s)      : %6.2f W                       ║\n", getHoraPrediccion().c_str(), prediccion_ia);
     Serial.println("╚══════════════════════════════════════════════════════════════╝\n");
+}
+
+String getHoraPrediccion() {
+    time_t ahora;
+    time(&ahora);                    // Obtenemos la hora actual (Epoch)
+    ahora += 3600;                   // Sumamos 3600 segundos (1 hora)
+    
+    struct tm infoTiempo;
+    localtime_r(&ahora, &infoTiempo); // Convertimos a estructura de tiempo local
+    
+    char bufferHora[10];
+    strftime(bufferHora, sizeof(bufferHora), "%H:%M", &infoTiempo); // Formateamos a HH:MM
+    
+    return String(bufferHora);
 }
